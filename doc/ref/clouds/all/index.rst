@@ -11,14 +11,14 @@ Full list of Salt Cloud modules
     :template: autosummary.rst.tmpl
 
     aliyun
-    botocore_aws
+    azurearm
     cloudstack
     digital_ocean
+    dimensiondata
     ec2
     gce
     gogrid
     joyent
-    libcloud_aws
     linode
     lxc
     msazure
@@ -26,9 +26,15 @@ Full list of Salt Cloud modules
     opennebula
     openstack
     parallels
+    profitbricks
     proxmox
-    rackspace
+    pyrax
+    qingcloud
     saltify
+    scaleway
     softlayer
     softlayer_hw
-    vsphere
+    virtualbox
+    vmware
+    vultrpy
+    xen

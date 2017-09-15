@@ -1,118 +1,109 @@
-===================
-Debian Installation
-===================
+.. _installation-debian:
 
-Currently the latest packages for Debian Old Stable, Stable and
-Unstable (Squeeze, Wheezy and Sid) are published in our
-(saltstack.com) Debian repository.
+===========================
+Debian GNU/Linux / Raspbian
+===========================
 
-Configure Apt
--------------
+Debian GNU/Linux distribution and some derivatives such as Raspbian already
+have included Salt packages to their repositories. However, current stable
+release codenamed "Jessie" contains old outdated Salt release. It is
+recommended to use SaltStack repository for Debian as described
+:ref:`below <installation-debian-repo>`.
 
+Installation from official Debian and Raspbian repositories is described
+:ref:`here <installation-debian-raspbian>`.
 
-Squeeze (Old Stable)
-~~~~~~~~~~~~~~~~~~~~
+.. _installation-debian-repo:
 
-For squeeze, you will need to enable the Debian backports repository
-as well as the debian.saltstack.com repository. To do so, add the
-following to ``/etc/apt/sources.list`` or a file in
-``/etc/apt/sources.list.d``::
+Installation from the Official SaltStack Repository
+===================================================
 
-  deb http://debian.saltstack.com/debian squeeze-saltstack main
-  deb http://backports.debian.org/debian-backports squeeze-backports main contrib non-free
+Packages for Debian 8 (Jessie) and Debian 7 (Wheezy) are available in the
+Official SaltStack repository.
 
+Instructions are at https://repo.saltstack.com/#debian.
 
+.. note::
+    Regular security support for Debian 7 ended on April 25th 2016. As a result,
+    2016.3.1 and 2015.8.10 will be the last Salt releases for which Debian
+    7 packages are created.
 
-Wheezy (Stable)
-~~~~~~~~~~~~~~~
+.. _installation-debian-raspbian:
 
-For wheezy, the following line is needed in either
-``/etc/apt/sources.list`` or a file in ``/etc/apt/sources.list.d``::
+Installation from the Debian / Raspbian Official Repository
+===========================================================
 
-  deb http://debian.saltstack.com/debian wheezy-saltstack main
+Stretch (Testing) and Sid (Unstable) distributions are already contain mostly
+up-to-date Salt packages built by Debian Salt Team. You can install Salt
+components directly from Debian.
 
-Jessie (Testing)
-~~~~~~~~~~~~~~~~
+On Jessie (Stable) there is an option to install Salt minion from Stretch with
+`python-tornado` dependency from `jessie-backports` repositories.
 
-For jessie, the following line is needed in either
-``/etc/apt/sources.list`` or a file in ``/etc/apt/sources.list.d``::
+To install fresh release of Salt minion on Jessie:
 
-  deb http://debian.saltstack.com/debian jessie-saltstack main
+#. Add `jessie-backports` and `stretch` repositories:
 
-Sid (Unstable)
-~~~~~~~~~~~~~~
+   **Debian**:
 
-For sid, the following line is needed in either
-``/etc/apt/sources.list`` or a file in ``/etc/apt/sources.list.d``::
+   .. code-block:: bash
 
-  deb http://debian.saltstack.com/debian unstable main
+       echo 'deb http://httpredir.debian.org/debian jessie-backports main' >> /etc/apt/sources.list
+       echo 'deb http://httpredir.debian.org/debian stretch main' >> /etc/apt/sources.list
 
+   **Raspbian**:
 
-Import the repository key.
---------------------------
+   .. code-block:: bash
 
-You will need to import the key used for signing.
+       echo 'deb http://archive.raspbian.org/raspbian/ stretch main' >> /etc/apt/sources.list
 
-.. code-block:: bash
+#. Make Jessie a default release:
 
-    wget -q -O- "http://debian.saltstack.com/debian-salt-team-joehealy.gpg.key" | apt-key add -
+   .. code-block:: bash
 
-.. note:: 
- 
-    You can optionally verify the key integrity with ``sha512sum`` using the 
-    public key signature shown here. E.g::
+       echo 'APT::Default-Release "jessie";' > /etc/apt/apt.conf.d/10apt
 
-        echo "b702969447140d5553e31e9701be13ca11cc0a7ed5fe2b30acb8491567560ee62f834772b5095d735dfcecb2384a5c1a20045f52861c417f50b68dd5ff4660e6  debian-salt-team-joehealy.gpg.key" | sha512sum -c
+#. Install Salt dependencies:
 
-Update the package database
----------------------------
+   **Debian**:
 
-.. code-block:: bash
+   .. code-block:: bash
 
-    apt-get update
+       apt-get update
+       apt-get install python-zmq python-systemd/jessie-backports python-tornado/jessie-backports salt-common/stretch
 
+   **Raspbian**:
 
-Install packages
-----------------
+   .. code-block:: bash
 
-Install the Salt master, minion, or syndic from the repository with the apt-get 
-command. These examples each install one daemon, but more than one package name 
-may be given at a time:
+       apt-get update
+       apt-get install python-zmq python-tornado/stretch salt-common/stretch
 
-.. code-block:: bash
+#. Install Salt minion package from Stretch:
 
-    apt-get install salt-master 
+   .. code-block:: bash
 
-.. code-block:: bash
+       apt-get install salt-minion/stretch
 
-    apt-get install salt-minion
+.. _debian-install-pkgs:
 
-.. code-block:: bash
+Install Packages
+================
 
-    apt-get install salt-syndic
+Install the Salt master, minion or other packages from the repository with
+the `apt-get` command. These examples each install one of Salt components, but
+more than one package name may be given at a time:
 
-.. _Debian-config:
+- ``apt-get install salt-api``
+- ``apt-get install salt-cloud``
+- ``apt-get install salt-master``
+- ``apt-get install salt-minion``
+- ``apt-get install salt-ssh``
+- ``apt-get install salt-syndic``
+
+.. _debian-config:
 
 Post-installation tasks
------------------------
+=======================
 
-Now, go to the :doc:`Configuring Salt </ref/configuration/index>` page.
-
-
-Notes
------
-
-1. These packages will be backported from the packages intended to be
-uploaded into Debian unstable. This means that the packages will be
-built for unstable first and then backported over the next day or so.
-
-2. These packages will be tracking the released versions of salt
-rather than maintaining a stable fixed feature set. If a fixed version
-is what you desire, then either pinning or manual installation may be
-more appropriate for you.
-
-3. The version numbering and backporting process should provide clean
-upgrade paths between Debian versions.
-
-If you have any questions regarding these, please email the mailing
-list or look for joehh on IRC.
+Now, go to the :ref:`Configuring Salt <configuring-salt>` page.

@@ -6,10 +6,11 @@ JSON Renderer for Salt
 from __future__ import absolute_import
 
 # Import python libs
-import json
+import salt.utils
+json = salt.utils.import_json()
 
 # Import salt libs
-from salt._compat import string_types
+from salt.ext.six import string_types
 
 
 def render(json_data, saltenv='base', sls='', **kws):

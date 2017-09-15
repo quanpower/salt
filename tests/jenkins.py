@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
-
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 '''
 This script is used to test Salt from a Jenkins server, specifically
 jenkins.saltstack.com.
@@ -9,19 +8,21 @@ This script is intended to be shell-centric!!
 '''
 
 # Import python libs
-from __future__ import print_function
+from __future__ import absolute_import, print_function
+import glob
 import os
 import re
 import sys
 import json
 import time
-import random
 import shutil
-import hashlib
 import optparse
 import subprocess
+import random
 
 # Import Salt libs
+import salt.utils.files
+import salt.utils.stringutils
 try:
     from salt.utils.nb_popen import NonBlockingPopen
 except ImportError:
@@ -45,10 +46,10 @@ except ImportError:
 # Import 3rd-party libs
 import yaml
 try:
-    import github
-    HAS_GITHUB = True
+    import requests
+    HAS_REQUESTS = True
 except ImportError:
-    HAS_GITHUB = False
+    HAS_REQUESTS = False
 
 SALT_GIT_URL = 'https://github.com/saltstack/salt.git'
 
@@ -57,7 +58,9 @@ def build_pillar_data(options):
     '''
     Build a YAML formatted string to properly pass pillar data
     '''
-    pillar = {}
+    pillar = {'test_transport': options.test_transport,
+              'cloud_only': options.cloud_only,
+              'with_coverage': options.test_without_coverage is False}
     if options.test_git_commit is not None:
         pillar['test_git_commit'] = options.test_git_commit
     if options.test_git_url is not None:
@@ -66,6 +69,12 @@ def build_pillar_data(options):
         pillar['bootstrap_salt_url'] = options.bootstrap_salt_url
     if options.bootstrap_salt_commit is not None:
         pillar['bootstrap_salt_commit'] = options.bootstrap_salt_commit
+    if options.package_source_dir:
+        pillar['package_source_dir'] = options.package_source_dir
+    if options.package_build_dir:
+        pillar['package_build_dir'] = options.package_build_dir
+    if options.package_artifact_dir:
+        pillar['package_artifact_dir'] = options.package_artifact_dir
     if options.pillar:
         pillar.update(dict(options.pillar))
     return yaml.dump(pillar, default_flow_style=True, indent=0, width=sys.maxint).rstrip()
@@ -76,7 +85,7 @@ def build_minion_target(options, vm_name):
     for grain in options.grain_target:
         target += ' and G@{0}'.format(grain)
     if options.grain_target:
-        return '-C "{0}"'.format(target)
+        return '"{0}"'.format(target)
     return target
 
 
@@ -87,8 +96,7 @@ def generate_vm_name(options):
     if 'BUILD_NUMBER' in os.environ:
         random_part = 'BUILD{0:0>6}'.format(os.environ.get('BUILD_NUMBER'))
     else:
-        random_part = hashlib.md5(
-            str(random.randint(1, 100000000))).hexdigest()[:6]
+        random_part = os.urandom(3).encode('hex')
 
     return '{0}-{1}-{2}'.format(options.vm_prefix, options.platform, random_part)
 
@@ -108,11 +116,11 @@ def delete_vm(options):
         stderr=subprocess.PIPE,
         stream_stds=True
     )
-    proc.poll_and_read_until_finish()
+    proc.poll_and_read_until_finish(interval=0.5)
     proc.communicate()
 
 
-def echo_parseable_environment(options):
+def echo_parseable_environment(options, parser):
     '''
     Echo NAME=VAL parseable output
     '''
@@ -134,37 +142,37 @@ def echo_parseable_environment(options):
         # This is a Jenkins triggered Pull Request
         # We need some more data about the Pull Request available to the
         # environment
-        if not HAS_GITHUB:
-            print('# The script NEEDS the github python package installed')
-            sys.stdout.write('\n'.join(output))
-            sys.stdout.flush()
-            return
+        if HAS_REQUESTS is False:
+            parser.error(
+                'The python \'requests\' library needs to be installed'
+            )
+
+        headers = {}
+        url = 'https://api.github.com/repos/saltstack/salt/pulls/{0}'.format(options.pull_request)
 
         github_access_token_path = os.path.join(
-            os.environ['JENKINS_HOME'], '.github_token'
+            os.environ.get('JENKINS_HOME', os.path.expanduser('~')),
+            '.github_token'
         )
-        if not os.path.isfile(github_access_token_path):
-            print(
-                '# The github token file({0}) does not exit'.format(
-                    github_access_token_path
-                )
-            )
-            sys.stdout.write('\n'.join(output))
-            sys.stdout.flush()
-            return
+        if os.path.isfile(github_access_token_path):
+            with salt.utils.files.fopen(github_access_token_path) as rfh:
+                headers = {
+                    'Authorization': 'token {0}'.format(rfh.read().strip())
+                }
 
-        GITHUB = github.Github(open(github_access_token_path).read().strip())
-        REPO = GITHUB.get_repo('saltstack/salt')
-        try:
-            PR = REPO.get_pull(options.pull_request)
-            output.extend([
-                'SALT_PR_GIT_URL={0}'.format(PR.head.repo.clone_url),
-                'SALT_PR_GIT_COMMIT={0}'.format(PR.head.sha)
-            ])
-            options.test_git_url = PR.head.repo.clone_url
-            options.test_git_commit = PR.head.sha
-        except ValueError:
-            print('# Failed to get the PR id from the environment')
+        http_req = requests.get(url, headers=headers)
+        if http_req.status_code != 200:
+            parser.error(
+                'Unable to get the pull request: {0[message]}'.format(http_req.json())
+            )
+
+        pr_details = http_req.json()
+        output.extend([
+            'SALT_PR_GIT_URL={0}'.format(pr_details['head']['repo']['clone_url']),
+            'SALT_PR_GIT_BRANCH={0}'.format(pr_details['head']['ref']),
+            'SALT_PR_GIT_COMMIT={0}'.format(pr_details['head']['sha']),
+            'SALT_PR_GIT_BASE_BRANCH={0}'.format(pr_details['base']['ref']),
+        ])
 
     sys.stdout.write('\n\n{0}\n\n'.format('\n'.join(output)))
     sys.stdout.flush()
@@ -182,7 +190,7 @@ def download_unittest_reports(options):
     os.makedirs(xml_reports_path)
 
     cmds = (
-        'salt {0} archive.tar zcvf /tmp/xml-test-reports.tar.gz \'*.xml\' cwd=/tmp/xml-unitests-output/',
+        'salt {0} archive.tar zcvf /tmp/xml-test-reports.tar.gz \'*.xml\' cwd=/tmp/xml-unittests-output/',
         'salt {0} cp.push /tmp/xml-test-reports.tar.gz',
         'mv -f /var/cache/salt/master/minions/{1}/files/tmp/xml-test-reports.tar.gz {2} && '
         'tar zxvf {2}/xml-test-reports.tar.gz -C {2}/xml-test-reports && '
@@ -202,7 +210,7 @@ def download_unittest_reports(options):
             stderr=subprocess.PIPE,
             stream_stds=True
         )
-        proc.poll_and_read_until_finish()
+        proc.poll_and_read_until_finish(interval=0.5)
         proc.communicate()
         if proc.returncode != 0:
             print(
@@ -242,7 +250,7 @@ def download_coverage_report(options):
             stderr=subprocess.PIPE,
             stream_stds=True
         )
-        proc.poll_and_read_until_finish()
+        proc.poll_and_read_until_finish(interval=0.5)
         proc.communicate()
         if proc.returncode != 0:
             print(
@@ -298,7 +306,53 @@ def download_remote_logs(options):
             stderr=subprocess.PIPE,
             stream_stds=True
         )
-        proc.poll_and_read_until_finish()
+        proc.poll_and_read_until_finish(interval=0.5)
+        proc.communicate()
+        if proc.returncode != 0:
+            print(
+                '\nFailed to execute command. Exit code: {0}'.format(
+                    proc.returncode
+                )
+            )
+        time.sleep(0.25)
+
+
+def download_packages(options):
+    print('Downloading packages...')
+    sys.stdout.flush()
+
+    workspace = options.workspace
+    vm_name = options.download_packages
+
+    for fglob in ('salt-*.rpm',
+                  'salt-*.deb',
+                  'salt-*.pkg.xz',
+                  'salt-buildpackage.log'):
+        for fname in glob.glob(os.path.join(workspace, fglob)):
+            if os.path.isfile(fname):
+                os.unlink(fname)
+
+    cmds = [
+        ('salt {{0}} archive.tar czf {0}.tar.gz sources=\'*.*\' cwd={0}'
+         .format(options.package_artifact_dir)),
+        'salt {{0}} cp.push {0}.tar.gz'.format(options.package_artifact_dir),
+        ('tar -C {{2}} -xzf /var/cache/salt/master/minions/{{1}}/files{0}.tar.gz'
+         .format(options.package_artifact_dir)),
+    ]
+
+    for cmd in cmds:
+        cmd = cmd.format(build_minion_target(options, vm_name), vm_name, workspace)
+        print('Running CMD: {0}'.format(cmd))
+        sys.stdout.flush()
+
+        proc = NonBlockingPopen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stream_stds=True
+        )
+        proc.poll_and_read_until_finish(interval=0.5)
         proc.communicate()
         if proc.returncode != 0:
             print(
@@ -319,8 +373,10 @@ def run(opts):
     )
 
     if opts.download_remote_reports:
-        opts.download_coverage_report = vm_name
+        if opts.test_without_coverage is False:
+            opts.download_coverage_report = vm_name
         opts.download_unittest_reports = vm_name
+        opts.download_packages = vm_name
 
     if opts.bootstrap_salt_commit is not None:
         if opts.bootstrap_salt_url is None:
@@ -349,6 +405,11 @@ def run(opts):
                 **opts.__dict__
             )
         )
+    if opts.splay is not None:
+        # Sleep a random number of seconds
+        cloud_downtime = random.randint(0, opts.splay)
+        print('Sleeping random period before calling salt-cloud: {0}'.format(cloud_downtime))
+        time.sleep(cloud_downtime)
     print('Running CMD: {0}'.format(cmd))
     sys.stdout.flush()
 
@@ -359,7 +420,7 @@ def run(opts):
         stderr=subprocess.PIPE,
         stream_stds=True
     )
-    proc.poll_and_read_until_finish()
+    proc.poll_and_read_until_finish(interval=0.5)
     proc.communicate()
 
     retcode = proc.returncode
@@ -373,9 +434,11 @@ def run(opts):
     print('VM Bootstrapped. Exit code: {0}'.format(retcode))
     sys.stdout.flush()
 
-    print('Sleeping for 5 seconds to allow the minion to breathe a little')
+    # Sleep a random number of seconds
+    bootstrap_downtime = random.randint(0, opts.splay)
+    print('Sleeping for {0} seconds to allow the minion to breathe a little'.format(bootstrap_downtime))
     sys.stdout.flush()
-    time.sleep(5)
+    time.sleep(bootstrap_downtime)
 
     if opts.bootstrap_salt_commit is not None:
         # Let's find out if the installed version matches the passed in pillar
@@ -400,7 +463,8 @@ def run(opts):
                 delete_vm(opts)
             sys.exit(retcode)
 
-        if not stdout.strip():
+        outstr = salt.utils.stringutils.to_str(stdout).strip()
+        if not outstr:
             print('Failed to get the bootstrapped minion version(no output). Exit code: {0}'.format(retcode))
             sys.stdout.flush()
             if opts.clean and 'JENKINS_SALTCLOUD_VM_NAME' not in os.environ:
@@ -408,15 +472,21 @@ def run(opts):
             sys.exit(retcode)
 
         try:
-            version_info = json.loads(stdout.strip())
+            version_info = json.loads(outstr)
             bootstrap_minion_version = os.environ.get(
                 'SALT_MINION_BOOTSTRAP_RELEASE',
                 opts.bootstrap_salt_commit[:7]
             )
+            print('Minion reported salt version: {0}'.format(version_info))
             if bootstrap_minion_version not in version_info[vm_name]:
                 print('\n\nATTENTION!!!!\n')
                 print('The boostrapped minion version commit does not contain the desired commit:')
-                print(' {0!r} does not contain {1!r}'.format(version_info[vm_name], bootstrap_minion_version))
+                print(
+                    ' \'{0}\' does not contain \'{1}\''.format(
+                        version_info[vm_name],
+                        bootstrap_minion_version
+                    )
+                )
                 print('\n\n')
                 sys.stdout.flush()
                 #if opts.clean and 'JENKINS_SALTCLOUD_VM_NAME' not in os.environ:
@@ -425,18 +495,32 @@ def run(opts):
             else:
                 print('matches!')
         except ValueError:
-            print('Failed to load any JSON from {0!r}'.format(stdout.strip()))
+            print('Failed to load any JSON from \'{0}\''.format(outstr))
 
-    # Run preparation SLS
-    time.sleep(3)
-    cmd = (
-        'salt -t 1800 {target} state.sls {prep_sls} pillar="{pillar}" '
-        '--no-color'.format(
-            target=build_minion_target(opts, vm_name),
-            prep_sls=opts.prep_sls,
-            pillar=build_pillar_data(opts),
+    if opts.cloud_only:
+        # Run Cloud Provider tests preparation SLS
+        cloud_provider_downtime = random.randint(3, opts.splay)
+        time.sleep(cloud_provider_downtime)
+        cmd = (
+            'salt -t 900 {target} state.sls {cloud_prep_sls} pillar="{pillar}" '
+            '--no-color'.format(
+                target=build_minion_target(opts, vm_name),
+                cloud_prep_sls='cloud-only',
+                pillar=build_pillar_data(opts),
+            )
         )
-    )
+    else:
+        # Run standard preparation SLS
+        standard_sls_downtime = random.randint(3, opts.splay)
+        time.sleep(standard_sls_downtime)
+        cmd = (
+            'salt -t 1800 {target} state.sls {prep_sls} pillar="{pillar}" '
+            '--no-color'.format(
+                target=build_minion_target(opts, vm_name),
+                prep_sls=opts.prep_sls,
+                pillar=build_pillar_data(opts),
+            )
+        )
     print('Running CMD: {0}'.format(cmd))
     sys.stdout.flush()
 
@@ -449,11 +533,10 @@ def run(opts):
     stdout, stderr = proc.communicate()
 
     if stdout:
-        print(stdout)
-    sys.stdout.flush()
+        print(salt.utils.stringutils.to_str(stdout))
     if stderr:
-        print(stderr)
-    sys.stderr.flush()
+        print(salt.utils.stringutils.to_str(stderr))
+    sys.stdout.flush()
 
     retcode = proc.returncode
     if retcode != 0:
@@ -463,8 +546,47 @@ def run(opts):
             delete_vm(opts)
         sys.exit(retcode)
 
+    if opts.cloud_only:
+        cloud_provider_pillar = random.randint(3, opts.splay)
+        time.sleep(cloud_provider_pillar)
+        # Run Cloud Provider tests pillar preparation SLS
+        cmd = (
+            'salt -t 600 {target} state.sls {cloud_prep_sls} pillar="{pillar}" '
+            '--no-color'.format(
+                target=build_minion_target(opts, vm_name),
+                cloud_prep_sls='cloud-test-configs',
+                pillar=build_pillar_data(opts),
+            )
+        )
+        print('Running CMD: {0}'.format(cmd))
+        sys.stdout.flush()
+
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        stdout, stderr = proc.communicate()
+
+        if stdout:
+            # DO NOT print the state return here!
+            print('Cloud configuration files provisioned via pillar.')
+        if stderr:
+            print(salt.utils.stringutils.to_str(stderr))
+        sys.stdout.flush()
+
+        retcode = proc.returncode
+        if retcode != 0:
+            print('Failed to execute the preparation SLS file. Exit code: {0}'.format(retcode))
+            sys.stdout.flush()
+            if opts.clean and 'JENKINS_SALTCLOUD_VM_NAME' not in os.environ:
+                delete_vm(opts)
+            sys.exit(retcode)
+
     if opts.prep_sls_2 is not None:
-        time.sleep(3)
+        sls_2_downtime = random.randint(3, opts.splay)
+        time.sleep(sls_2_downtime)
 
         # Run the 2nd preparation SLS
         cmd = (
@@ -487,11 +609,10 @@ def run(opts):
         stdout, stderr = proc.communicate()
 
         if stdout:
-            print(stdout)
-        sys.stdout.flush()
+            print(salt.utils.stringutils.to_str(stdout))
         if stderr:
-            print(stderr)
-        sys.stderr.flush()
+            print(salt.utils.stringutils.to_str(stderr))
+        sys.stdout.flush()
 
         retcode = proc.returncode
         if retcode != 0:
@@ -503,7 +624,8 @@ def run(opts):
 
     # Run remote checks
     if opts.test_git_url is not None:
-        time.sleep(1)
+        test_git_downtime = random.randint(1, opts.splay)
+        time.sleep(test_git_downtime)
         # Let's find out if the cloned repository if checked out from the
         # desired repository
         print('Grabbing the cloned repository remotes information ... ')
@@ -517,7 +639,7 @@ def run(opts):
             stderr=subprocess.PIPE,
         )
 
-        proc.communicate()
+        stdout, _ = proc.communicate()
 
         retcode = proc.returncode
         if retcode != 0:
@@ -538,17 +660,18 @@ def run(opts):
             remotes_info = json.loads(stdout.strip())
             if remotes_info is None or remotes_info[vm_name] is None or opts.test_git_url not in remotes_info[vm_name]:
                 print('The cloned repository remote is not the desired one:')
-                print(' {0!r} is not in {1}'.format(opts.test_git_url, remotes_info))
+                print(' \'{0}\' is not in {1}'.format(opts.test_git_url, remotes_info))
                 sys.stdout.flush()
                 if opts.clean and 'JENKINS_SALTCLOUD_VM_NAME' not in os.environ:
                     delete_vm(opts)
                 sys.exit(retcode)
             print('matches!')
         except ValueError:
-            print('Failed to load any JSON from {0!r}'.format(stdout.strip()))
+            print('Failed to load any JSON from \'{0}\''.format(salt.utils.stringutils.to_str(stdout).strip()))
 
     if opts.test_git_commit is not None:
-        time.sleep(1)
+        test_git_commit_downtime = random.randint(1, opts.splay)
+        time.sleep(test_git_commit_downtime)
 
         # Let's find out if the cloned repository is checked out at the desired
         # commit
@@ -584,17 +707,18 @@ def run(opts):
             revision_info = json.loads(stdout.strip())
             if revision_info[vm_name][7:] != opts.test_git_commit[7:]:
                 print('The cloned repository commit is not the desired one:')
-                print(' {0!r} != {1!r}'.format(revision_info[vm_name][:7], opts.test_git_commit[:7]))
+                print(' \'{0}\' != \'{1}\''.format(revision_info[vm_name][:7], opts.test_git_commit[:7]))
                 sys.stdout.flush()
                 if opts.clean and 'JENKINS_SALTCLOUD_VM_NAME' not in os.environ:
                     delete_vm(opts)
                 sys.exit(retcode)
             print('matches!')
         except ValueError:
-            print('Failed to load any JSON from {0!r}'.format(stdout.strip()))
+            print('Failed to load any JSON from \'{0}\''.format(salt.utils.stringutils.to_str(stdout).strip()))
 
     # Run tests here
-    time.sleep(3)
+    test_begin_downtime = random.randint(3, opts.splay)
+    time.sleep(test_begin_downtime)
     cmd = (
         'salt -t 1800 {target} state.sls {sls} pillar="{pillar}" --no-color'.format(
             sls=opts.sls,
@@ -613,15 +737,15 @@ def run(opts):
     )
     stdout, stderr = proc.communicate()
 
-    if stdout:
-        print(stdout)
-    sys.stdout.flush()
+    outstr = salt.utils.stringutils.to_str(stdout)
+    if outstr:
+        print(outstr)
     if stderr:
-        print(stderr)
-    sys.stderr.flush()
+        print(salt.utils.stringutils.to_str(stderr))
+    sys.stdout.flush()
 
     try:
-        match = re.search(r'Test Suite Exit Code: (?P<exitcode>[\d]+)', stdout)
+        match = re.search(r'Test Suite Exit Code: (?P<exitcode>[\d]+)', outstr)
         retcode = int(match.group('exitcode'))
     except AttributeError:
         # No regex matching
@@ -632,15 +756,45 @@ def run(opts):
     except TypeError:
         # No output!?
         retcode = 1
-        if stdout:
+        if outstr:
             # Anything else, raise the exception
             raise
+
+    if retcode == 0:
+        # Build packages
+        time.sleep(3)
+        cmd = (
+            'salt -t 1800 {target} state.sls buildpackage pillar="{pillar}" --no-color'.format(
+                pillar=build_pillar_data(opts),
+                target=build_minion_target(opts, vm_name),
+            )
+        )
+        print('Running CMD: {0}'.format(cmd))
+        sys.stdout.flush()
+
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, stderr = proc.communicate()
+
+        if stdout:
+            print(salt.utils.stringutils.to_str(stdout))
+        if stderr:
+            print(salt.utils.stringutils.to_str(stderr))
+        sys.stdout.flush()
+
+        # Grab packages and log file (or just log file if build failed)
+        download_packages(opts)
 
     if opts.download_remote_reports:
         # Download unittest reports
         download_unittest_reports(opts)
         # Download coverage report
-        download_coverage_report(opts)
+        if opts.test_without_coverage is False:
+            download_coverage_report(opts)
 
     if opts.clean and 'JENKINS_SALTCLOUD_VM_NAME' not in os.environ:
         delete_vm(opts)
@@ -691,6 +845,19 @@ def parse():
         '--test-git-commit',
         default=None,
         help='The testing git commit to track')
+    parser.add_option(
+        '--test-transport',
+        default='zeromq',
+        choices=('zeromq', 'raet', 'tcp'),
+        help=('Select which transport to run the integration tests with, '
+              'zeromq, raet, or tcp. Default: %default')
+    )
+    parser.add_option(
+        '--test-without-coverage',
+        default=False,
+        action='store_true',
+        help='Do not generate coverage reports'
+    )
     parser.add_option(
         '--prep-sls',
         default='git.salt',
@@ -764,6 +931,41 @@ def parse():
         default=[],
         help='Match minions using compound matchers, the minion ID, plus the passed grain.'
     )
+    parser.add_option(
+        '--cloud-only',
+        default=False,
+        action='store_true',
+        help='Run the cloud provider tests only.'
+    )
+    parser.add_option(
+        '--build-packages',
+        default=True,
+        action='store_true',
+        help='Run buildpackage.py to create packages off of the git build.'
+    )
+    # These next three options are ignored if --build-packages is False
+    parser.add_option(
+        '--package-source-dir',
+        default='/testing',
+        help='Directory where the salt source code checkout is found '
+             '(default: %default)',
+    )
+    parser.add_option(
+        '--package-build-dir',
+        default='/tmp/salt-buildpackage',
+        help='Build root for automated package builds (default: %default)',
+    )
+    parser.add_option(
+        '--package-artifact-dir',
+        default='/tmp/salt-packages',
+        help='Location on the minion from which packages should be '
+             'retrieved (default: %default)',
+    )
+    parser.add_option(
+        '--splay',
+        default='10',
+        help='The number of seconds across which calls to provisioning components should be made'
+    )
 
     options, args = parser.parse_args()
 
@@ -775,9 +977,10 @@ def parse():
         download_unittest_reports(options)
         parser.exit(0)
 
-    if options.download_coverage_report is not None and not options.test_git_commit:
-        download_coverage_report(options)
-        parser.exit(0)
+    if options.test_without_coverage is False:
+        if options.download_coverage_report is not None and not options.test_git_commit:
+            download_coverage_report(options)
+            parser.exit(0)
 
     if options.download_remote_logs is not None and not options.test_git_commit:
         download_remote_logs(options)
@@ -790,7 +993,7 @@ def parse():
         parser.exit('--provider or --pull-request is required')
 
     if options.echo_parseable_environment:
-        echo_parseable_environment(options)
+        echo_parseable_environment(options, parser)
         parser.exit(0)
 
     if not options.test_git_commit and not options.pull_request:

@@ -4,13 +4,30 @@ Support for ipset
 '''
 
 # Import python libs
+from __future__ import absolute_import
 import logging
 
-# Import salt libs
-import salt.utils
+# Import Salt libs
+from salt.ext import six
+from salt.ext.six.moves import map, range
+import salt.utils.path
+
+# Import third-party libs
+if six.PY3:
+    import ipaddress
+else:
+    import salt.ext.ipaddress as ipaddress
 
 # Set up logging
 log = logging.getLogger(__name__)
+
+
+# Fix included in py2-ipaddress for 32bit architectures
+# Except that xrange only supports machine integers, not longs, so...
+def long_range(start, end):
+    while start < end:
+        yield start
+        start += 1
 
 _IPSET_FAMILIES = {
         'ipv4': 'inet',
@@ -91,16 +108,16 @@ def __virtual__():
     '''
     Only load the module if ipset is installed
     '''
-    if salt.utils.which('ipset'):
+    if salt.utils.path.which('ipset'):
         return True
-    return False
+    return (False, 'The ipset execution modules cannot be loaded: ipset binary not in path.')
 
 
 def _ipset_cmd():
     '''
     Return correct command
     '''
-    return salt.utils.which('ipset')
+    return salt.utils.path.which('ipset')
 
 
 def version():
@@ -121,7 +138,7 @@ def version():
 
 def new_set(set=None, set_type=None, family='ipv4', comment=False, **kwargs):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Create new custom set
 
@@ -165,7 +182,7 @@ def new_set(set=None, set_type=None, family='ipv4', comment=False, **kwargs):
     if comment:
         cmd = '{0} comment'.format(cmd)
 
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if not out:
         out = True
@@ -174,7 +191,7 @@ def new_set(set=None, set_type=None, family='ipv4', comment=False, **kwargs):
 
 def delete_set(set=None, family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Delete ipset set.
 
@@ -192,7 +209,7 @@ def delete_set(set=None, family='ipv4'):
         return 'Error: Set needs to be specified'
 
     cmd = '{0} destroy {1}'.format(_ipset_cmd(), set)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if not out:
         out = True
@@ -201,7 +218,7 @@ def delete_set(set=None, family='ipv4'):
 
 def rename_set(set=None, new_set=None, family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Delete ipset set.
 
@@ -230,7 +247,7 @@ def rename_set(set=None, new_set=None, family='ipv4'):
         return 'Error: New Set already exists'
 
     cmd = '{0} rename {1} {2}'.format(_ipset_cmd(), set, new_set)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if not out:
         out = True
@@ -239,7 +256,7 @@ def rename_set(set=None, new_set=None, family='ipv4'):
 
 def list_sets(family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     List all ipset sets.
 
@@ -250,8 +267,8 @@ def list_sets(family='ipv4'):
         salt '*' ipset.list_sets
 
     '''
-    cmd = '{0} list -t'.format(_ipset_cmd(), set)
-    out = __salt__['cmd.run'](cmd)
+    cmd = '{0} list -t'.format(_ipset_cmd())
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     _tmp = out.split('\n')
 
@@ -270,9 +287,9 @@ def list_sets(family='ipv4'):
 
 def check_set(set=None, family='ipv4'):
     '''
-    .. versionadded:: Helium
-
     Check that given ipset set exists.
+
+    .. versionadded:: 2014.7.0
 
     CLI Example:
 
@@ -339,7 +356,7 @@ def add(set=None, entry=None, family='ipv4', **kwargs):
 
     # Using -exist to ensure entries are updated if the comment changes
     cmd = '{0} add -exist {1} {2}'.format(_ipset_cmd(), set, cmd)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if len(out) == 0:
         return 'Success'
@@ -368,7 +385,7 @@ def delete(set=None, entry=None, family='ipv4', **kwargs):
         return 'Error: Set {0} does not exist'.format(set)
 
     cmd = '{0} del {1} {2}'.format(_ipset_cmd(), set, entry)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if len(out) == 0:
         return 'Success'
@@ -378,6 +395,22 @@ def delete(set=None, entry=None, family='ipv4', **kwargs):
 def check(set=None, entry=None, family='ipv4'):
     '''
     Check that an entry exists in the specified set.
+
+    set
+        The ipset name
+
+    entry
+        An entry in the ipset.  This parameter can be a single IP address, a
+        range of IP addresses, or a subnet block.  Example:
+
+        .. code-block:: cfg
+
+            192.168.0.1
+            192.168.0.2-192.168.0.19
+            192.168.0.0/25
+
+    family
+        IP protocol version: ipv4 or ipv6
 
     CLI Example:
 
@@ -395,9 +428,22 @@ def check(set=None, entry=None, family='ipv4'):
     if not settype:
         return 'Error: Set {0} does not exist'.format(set)
 
-    current_members = _find_set_members(set)
-    if entry in current_members:
-        return True
+    current_members = _parse_members(settype, _find_set_members(set))
+
+    if not len(current_members):
+        return False
+
+    if isinstance(entry, list):
+        entries = _parse_members(settype, entry)
+    else:
+        entries = [_parse_member(settype, entry)]
+
+    for current_member in current_members:
+        for entry in entries:
+            if _member_contains(current_member, entry):
+                # print "{0} contains {1}".format(current_member, entry)
+                return True
+
     return False
 
 
@@ -424,7 +470,7 @@ def test(set=None, entry=None, family='ipv4', **kwargs):
         return 'Error: Set {0} does not exist'.format(set)
 
     cmd = '{0} test {1} {2}'.format(_ipset_cmd(), set, entry)
-    out = __salt__['cmd.run_all'](cmd)
+    out = __salt__['cmd.run_all'](cmd, python_shell=False)
 
     if out['retcode'] > 0:
         # Entry doesn't exist in set return false
@@ -458,12 +504,12 @@ def flush(set=None, family='ipv4'):
 
     ipset_family = _IPSET_FAMILIES[family]
     if set:
-        #cmd = '{0} flush {1} family {2}'.format(_ipset_cmd(), set, ipset_family)
+        # cmd = '{0} flush {1} family {2}'.format(_ipset_cmd(), set, ipset_family)
         cmd = '{0} flush {1}'.format(_ipset_cmd(), set)
     else:
-        #cmd = '{0} flush family {1}'.format(_ipset_cmd(), ipset_family)
+        # cmd = '{0} flush family {1}'.format(_ipset_cmd(), ipset_family)
         cmd = '{0} flush'.format(_ipset_cmd())
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if len(out) == 0:
         return True
@@ -477,7 +523,7 @@ def _find_set_members(set):
     '''
 
     cmd = '{0} list {1}'.format(_ipset_cmd(), set)
-    out = __salt__['cmd.run_all'](cmd)
+    out = __salt__['cmd.run_all'](cmd, python_shell=False)
 
     if out['retcode'] > 0:
         # Set doesn't exist return false
@@ -500,7 +546,7 @@ def _find_set_info(set):
     '''
 
     cmd = '{0} list -t {1}'.format(_ipset_cmd(), set)
-    out = __salt__['cmd.run_all'](cmd)
+    out = __salt__['cmd.run_all'](cmd, python_shell=False)
 
     if out['retcode'] > 0:
         # Set doesn't exist return false
@@ -509,8 +555,10 @@ def _find_set_info(set):
     setinfo = {}
     _tmp = out['stdout'].split('\n')
     for item in _tmp:
-        key, value = item.split(':', 1)
-        setinfo[key] = value[1:]
+        # Only split if item has a colon
+        if ':' in item:
+            key, value = item.split(':', 1)
+            setinfo[key] = value[1:]
     return setinfo
 
 
@@ -524,3 +572,104 @@ def _find_set_type(set):
         return setinfo['Type']
     else:
         return False
+
+
+def _parse_members(settype, members):
+    if isinstance(members, six.string_types):
+
+        return [_parse_member(settype, members)]
+
+    return [_parse_member(settype, member) for member in members]
+
+
+def _parse_member(settype, member, strict=False):
+    subtypes = settype.split(':')[1].split(',')
+
+    parts = member.split(' ')
+
+    parsed_member = []
+    for i in range(len(subtypes)):
+        subtype = subtypes[i]
+        part = parts[i]
+
+        if subtype in ['ip', 'net']:
+            try:
+                if '/' in part:
+                    part = ipaddress.ip_network(part, strict=strict)
+                elif '-' in part:
+                    start, end = list(map(ipaddress.ip_address, part.split('-')))
+
+                    part = list(ipaddress.summarize_address_range(start, end))
+                else:
+                    part = ipaddress.ip_address(part)
+            except ValueError:
+                pass
+
+        elif subtype == 'port':
+            part = int(part)
+
+        parsed_member.append(part)
+
+    if len(parts) > len(subtypes):
+        parsed_member.append(' '.join(parts[len(subtypes):]))
+
+    return parsed_member
+
+
+def _members_contain(members, entry):
+    pass
+
+
+def _member_contains(member, entry):
+    if len(member) < len(entry):
+        return False
+
+    for i in range(len(entry)):
+        if not _compare_member_parts(member[i], entry[i]):
+            return False
+
+    return True
+
+
+def _compare_member_parts(member_part, entry_part):
+    if member_part == entry_part:
+        # this covers int, string, and equal ip and net
+        return True
+
+    # for ip ranges parsed with summarize_address_range
+    if isinstance(entry_part, list):
+        for entry_part_item in entry_part:
+            if not _compare_member_parts(member_part, entry_part_item):
+                return False
+
+        return True
+
+    # below we only deal with ip and net objects
+    if _is_address(member_part):
+        if _is_network(entry_part):
+            return member_part in entry_part
+
+    elif _is_network(member_part):
+        if _is_address(entry_part):
+            return entry_part in member_part
+
+        # both are networks, and == was false
+        return False
+
+        # This could be changed to support things like
+        # 192.168.0.4/30 contains 192.168.0.4/31
+        #
+        # return entry_part.network_address in member_part \
+        #    and entry_part.broadcast_address in member_part
+
+    return False
+
+
+def _is_network(o):
+    return isinstance(o, ipaddress.IPv4Network) \
+        or isinstance(o, ipaddress.IPv6Network)
+
+
+def _is_address(o):
+    return isinstance(o, ipaddress.IPv4Address) \
+        or isinstance(o, ipaddress.IPv6Address)

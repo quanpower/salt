@@ -16,9 +16,15 @@ Example output::
     {'myminion': {'foo': {'list': ['Hello', 'World'], 'bar': 'baz', 'dictionary': {'abc': 123, 'def': 456}}}}
 '''
 
+# Import Python libs
+from __future__ import absolute_import
 
-def output(data):
+# Import Salt libs
+import salt.utils.locales
+
+
+def output(data, **kwargs):  # pylint: disable=unused-argument
     '''
     Rather basic....
     '''
-    return str(data)
+    return salt.utils.locales.sdecode(str(data))

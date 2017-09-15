@@ -6,6 +6,8 @@ This system allows for authentication to be managed in a module pluggable way
 so that any external authentication system can be used inside of Salt
 '''
 
+from __future__ import absolute_import
+
 # 1. Create auth loader instance
 # 2. Accept arguments as a dict
 # 3. Verify with function introspection
@@ -15,32 +17,46 @@ so that any external authentication system can be used inside of Salt
 
 # Import python libs
 from __future__ import print_function
-import os
-import hashlib
+import collections
 import time
 import logging
 import random
 import getpass
+from salt.ext.six.moves import input
 
 # Import salt libs
 import salt.config
 import salt.loader
+import salt.transport.client
 import salt.utils
+import salt.utils.files
 import salt.utils.minions
+import salt.utils.versions
 import salt.payload
 
 log = logging.getLogger(__name__)
+
+AUTH_INTERNAL_KEYWORDS = frozenset([
+    'client',
+    'cmd',
+    'eauth',
+    'fun',
+    'kwarg',
+    'match'
+])
 
 
 class LoadAuth(object):
     '''
     Wrap the authentication system to handle peripheral components
     '''
-    def __init__(self, opts):
+    def __init__(self, opts, ckminions=None):
         self.opts = opts
         self.max_fail = 1.0
         self.serial = salt.payload.Serial(opts)
         self.auth = salt.loader.auth(opts)
+        self.tokens = salt.loader.eauth_tokens(opts)
+        self.ckminions = ckminions or salt.utils.minions.CkMinions(opts)
 
     def load_name(self, load):
         '''
@@ -52,9 +68,9 @@ class LoadAuth(object):
         fstr = '{0}.auth'.format(load['eauth'])
         if fstr not in self.auth:
             return ''
-        fcall = salt.utils.format_call(self.auth[fstr], load)
         try:
-            return fcall['args'][0]
+            pname_arg = salt.utils.arg_lookup(self.auth[fstr])['args'][0]
+            return load[pname_arg]
         except IndexError:
             return ''
 
@@ -70,15 +86,16 @@ class LoadAuth(object):
         fstr = '{0}.auth'.format(load['eauth'])
         if fstr not in self.auth:
             return False
-        fcall = salt.utils.format_call(self.auth[fstr], load)
+        fcall = salt.utils.format_call(self.auth[fstr],
+                                       load,
+                                       expected_extra_kws=AUTH_INTERNAL_KEYWORDS)
         try:
             if 'kwargs' in fcall:
                 return self.auth[fstr](*fcall['args'], **fcall['kwargs'])
             else:
                 return self.auth[fstr](*fcall['args'])
-        except Exception as exc:
-            err = 'Authentication module threw an exception: {0}'.format(exc)
-            log.critical(err)
+        except Exception as e:
+            log.debug('Authentication module threw {0}'.format(e))
             return False
 
     def time_auth(self, load):
@@ -93,13 +110,52 @@ class LoadAuth(object):
         if f_time > self.max_fail:
             self.max_fail = f_time
         deviation = self.max_fail / 4
-        r_time = random.uniform(
+        r_time = random.SystemRandom().uniform(
                 self.max_fail - deviation,
                 self.max_fail + deviation
                 )
         while start + r_time > time.time():
             time.sleep(0.001)
         return False
+
+    def __get_acl(self, load):
+        '''
+        Returns ACL for a specific user.
+        Returns None if eauth doesn't provide any for the user. I. e. None means: use acl declared
+        in master config.
+        '''
+        if 'eauth' not in load:
+            return None
+        mod = self.opts['eauth_acl_module']
+        if not mod:
+            mod = load['eauth']
+        fstr = '{0}.acl'.format(mod)
+        if fstr not in self.auth:
+            return None
+        fcall = salt.utils.format_call(self.auth[fstr],
+                                       load,
+                                       expected_extra_kws=AUTH_INTERNAL_KEYWORDS)
+        try:
+            return self.auth[fstr](*fcall['args'], **fcall['kwargs'])
+        except Exception as e:
+            log.debug('Authentication module threw {0}'.format(e))
+            return None
+
+    def __process_acl(self, load, auth_list):
+        '''
+        Allows eauth module to modify the access list right before it'll be applied to the request.
+        For example ldap auth module expands entries
+        '''
+        if 'eauth' not in load:
+            return auth_list
+        fstr = '{0}.process_acl'.format(load['eauth'])
+        if fstr not in self.auth:
+            return auth_list
+        try:
+            return self.auth[fstr](auth_list, self.opts)
+        except Exception as e:
+            log.debug('Authentication module threw {0}'.format(e))
+            return auth_list
 
     def get_groups(self, load):
         '''
@@ -111,7 +167,9 @@ class LoadAuth(object):
         fstr = '{0}.groups'.format(load['eauth'])
         if fstr not in self.auth:
             return False
-        fcall = salt.utils.format_call(self.auth[fstr], load)
+        fcall = salt.utils.format_call(self.auth[fstr],
+                                       load,
+                                       expected_extra_kws=AUTH_INTERNAL_KEYWORDS)
         try:
             return self.auth[fstr](*fcall['args'], **fcall['kwargs'])
         except IndexError:
@@ -119,40 +177,60 @@ class LoadAuth(object):
         except Exception:
             return None
 
+    def _allow_custom_expire(self, load):
+        '''
+        Return bool if requesting user is allowed to set custom expire
+        '''
+        expire_override = self.opts.get('token_expire_user_override', False)
+
+        if expire_override is True:
+            return True
+
+        if isinstance(expire_override, collections.Mapping):
+            expire_whitelist = expire_override.get(load['eauth'], [])
+            if isinstance(expire_whitelist, collections.Iterable):
+                if load.get('username') in expire_whitelist:
+                    return True
+
+        return False
+
     def mk_token(self, load):
         '''
         Run time_auth and create a token. Return False or the token
         '''
-        ret = self.time_auth(load)
-        if ret is False:
+        if not self.authenticate_eauth(load):
             return {}
-        fstr = '{0}.auth'.format(load['eauth'])
-        hash_type = getattr(hashlib, self.opts.get('hash_type', 'md5'))
-        tok = str(hash_type(os.urandom(512)).hexdigest())
-        t_path = os.path.join(self.opts['token_dir'], tok)
-        while os.path.isfile(t_path):
-            tok = str(hash_type(os.urandom(512)).hexdigest())
-            t_path = os.path.join(self.opts['token_dir'], tok)
-        fcall = salt.utils.format_call(self.auth[fstr], load)
+
+        if self._allow_custom_expire(load):
+            token_expire = load.pop('token_expire', self.opts['token_expire'])
+        else:
+            _ = load.pop('token_expire', None)
+            token_expire = self.opts['token_expire']
+
         tdata = {'start': time.time(),
-                 'expire': time.time() + self.opts['token_expire'],
-                 'name': fcall['args'][0],
-                 'eauth': load['eauth'],
-                 'token': tok}
-        with salt.utils.fopen(t_path, 'w+b') as fp_:
-            fp_.write(self.serial.dumps(tdata))
-        return tdata
+                 'expire': time.time() + token_expire,
+                 'name': self.load_name(load),
+                 'eauth': load['eauth']}
+
+        if self.opts['keep_acl_in_token']:
+            acl_ret = self.__get_acl(load)
+            tdata['auth_list'] = acl_ret
+
+        groups = self.get_groups(load)
+        if groups:
+            tdata['groups'] = groups
+
+        return self.tokens["{0}.mk_token".format(self.opts['eauth_tokens'])](self.opts, tdata)
 
     def get_tok(self, tok):
         '''
         Return the name associated with the token, or False if the token is
         not valid
         '''
-        t_path = os.path.join(self.opts['token_dir'], tok)
-        if not os.path.isfile(t_path):
+        tdata = self.tokens["{0}.get_token".format(self.opts['eauth_tokens'])](self.opts, tok)
+        if not tdata:
             return {}
-        with salt.utils.fopen(t_path, 'rb') as fp_:
-            tdata = self.serial.loads(fp_.read())
+
         rm_tok = False
         if 'expire' not in tdata:
             # invalid token, delete it!
@@ -160,12 +238,240 @@ class LoadAuth(object):
         if tdata.get('expire', '0') < time.time():
             rm_tok = True
         if rm_tok:
-            try:
-                os.remove(t_path)
-                return {}
-            except (IOError, OSError):
-                pass
+            self.rm_token(tok)
+
         return tdata
+
+    def list_tokens(self):
+        '''
+        List all tokens in eauth_tokn storage.
+        '''
+        return self.tokens["{0}.list_tokens".format(self.opts['eauth_tokens'])](self.opts)
+
+    def rm_token(self, tok):
+        '''
+        Remove the given token from token storage.
+        '''
+        self.tokens["{0}.rm_token".format(self.opts['eauth_tokens'])](self.opts, tok)
+
+    def authenticate_token(self, load):
+        '''
+        Authenticate a user by the token specified in load.
+        Return the token object or False if auth failed.
+        '''
+        token = self.get_tok(load['token'])
+
+        # Bail if the token is empty or if the eauth type specified is not allowed
+        if not token or token['eauth'] not in self.opts['external_auth']:
+            log.warning('Authentication failure of type "token" occurred.')
+            return False
+
+        return token
+
+    def authenticate_eauth(self, load):
+        '''
+        Authenticate a user by the external auth module specified in load.
+        Return True on success or False on failure.
+        '''
+        if 'eauth' not in load:
+            log.warning('Authentication failure of type "eauth" occurred.')
+            return False
+
+        if load['eauth'] not in self.opts['external_auth']:
+            # The eauth system is not enabled, fail
+            log.warning('Authentication failure of type "eauth" occurred.')
+            return False
+
+        # Perform the actual authentication. If we fail here, do not
+        # continue.
+        if not self.time_auth(load):
+            log.warning('Authentication failure of type "eauth" occurred.')
+            return False
+
+        return True
+
+    def authenticate_key(self, load, key):
+        '''
+        Authenticate a user by the key passed in load.
+        Return the effective user id (name) if it's different from the specified one (for sudo).
+        If the effective user id is the same as the passed one, return True on success or False on
+        failure.
+        '''
+        error_msg = 'Authentication failure of type "user" occurred.'
+        auth_key = load.pop('key', None)
+        if auth_key is None:
+            log.warning(error_msg)
+            return False
+
+        if 'user' in load:
+            auth_user = AuthUser(load['user'])
+            if auth_user.is_sudo():
+                # If someone sudos check to make sure there is no ACL's around their username
+                if auth_key != key[self.opts.get('user', 'root')]:
+                    log.warning(error_msg)
+                    return False
+                return auth_user.sudo_name()
+            elif load['user'] == self.opts.get('user', 'root') or load['user'] == 'root':
+                if auth_key != key[self.opts.get('user', 'root')]:
+                    log.warning(error_msg)
+                    return False
+            elif auth_user.is_running_user():
+                if auth_key != key.get(load['user']):
+                    log.warning(error_msg)
+                    return False
+            elif auth_key == key.get('root'):
+                pass
+            else:
+                if load['user'] in key:
+                    # User is authorised, check key and check perms
+                    if auth_key != key[load['user']]:
+                        log.warning(error_msg)
+                        return False
+                    return load['user']
+                else:
+                    log.warning(error_msg)
+                    return False
+        else:
+            if auth_key != key[salt.utils.get_user()]:
+                log.warning(error_msg)
+                return False
+        return True
+
+    def get_auth_list(self, load, token=None):
+        '''
+        Retrieve access list for the user specified in load.
+        The list is built by eauth module or from master eauth configuration.
+        Return None if current configuration doesn't provide any ACL for the user. Return an empty
+        list if the user has no rights to execute anything on this master and returns non-empty list
+        if user is allowed to execute particular functions.
+        '''
+        # Get auth list from token
+        if token and self.opts['keep_acl_in_token'] and 'auth_list' in token:
+            return token['auth_list']
+        # Get acl from eauth module.
+        auth_list = self.__get_acl(load)
+        if auth_list is not None:
+            return auth_list
+
+        eauth = token['eauth'] if token else load['eauth']
+        if eauth not in self.opts['external_auth']:
+            # No matching module is allowed in config
+            log.warning('Authorization failure occurred.')
+            return None
+
+        if token:
+            name = token['name']
+            groups = token.get('groups')
+        else:
+            name = self.load_name(load)  # The username we are attempting to auth with
+            groups = self.get_groups(load)  # The groups this user belongs to
+        eauth_config = self.opts['external_auth'][eauth]
+        if not groups:
+            groups = []
+        group_perm_keys = [item for item in eauth_config if item.endswith('%')]  # The configured auth groups
+
+        # First we need to know if the user is allowed to proceed via any of their group memberships.
+        group_auth_match = False
+        for group_config in group_perm_keys:
+            if group_config.rstrip('%') in groups:
+                group_auth_match = True
+                break
+        # If a group_auth_match is set it means only that we have a
+        # user which matches at least one or more of the groups defined
+        # in the configuration file.
+
+        external_auth_in_db = False
+        for entry in eauth_config:
+            if entry.startswith('^'):
+                external_auth_in_db = True
+                break
+
+        # If neither a catchall, a named membership or a group
+        # membership is found, there is no need to continue. Simply
+        # deny the user access.
+        if not ((name in eauth_config) |
+                ('*' in eauth_config) |
+                group_auth_match | external_auth_in_db):
+            # Auth successful, but no matching user found in config
+            log.warning('Authorization failure occurred.')
+            return None
+
+        # We now have an authenticated session and it is time to determine
+        # what the user has access to.
+        auth_list = []
+        if name in eauth_config:
+            auth_list = eauth_config[name]
+        elif '*' in eauth_config:
+            auth_list = eauth_config['*']
+        if group_auth_match:
+            auth_list = self.ckminions.fill_auth_list_from_groups(
+                    eauth_config,
+                    groups,
+                    auth_list)
+
+        auth_list = self.__process_acl(load, auth_list)
+
+        log.trace("Compiled auth_list: {0}".format(auth_list))
+
+        return auth_list
+
+    def check_authentication(self, load, auth_type, key=None, show_username=False):
+        '''
+        .. versionadded:: Oxygen
+
+        Go through various checks to see if the token/eauth/user can be authenticated.
+
+        Returns a dictionary containing the following keys:
+
+        - auth_list
+        - username
+        - error
+
+        If an error is encountered, return immediately with the relevant error dictionary
+        as authentication has failed. Otherwise, return the username and valid auth_list.
+        '''
+        auth_list = []
+        username = load.get('username', 'UNKNOWN')
+        ret = {'auth_list': auth_list,
+               'username': username,
+               'error': {}}
+
+        # Authenticate
+        if auth_type == 'token':
+            token = self.authenticate_token(load)
+            if not token:
+                ret['error'] = {'name': 'TokenAuthenticationError',
+                                'message': 'Authentication failure of type "token" occurred.'}
+                return ret
+
+            # Update username for token
+            username = token['name']
+            ret['username'] = username
+            auth_list = self.get_auth_list(load, token=token)
+        elif auth_type == 'eauth':
+            if not self.authenticate_eauth(load):
+                ret['error'] = {'name': 'EauthAuthenticationError',
+                                'message': 'Authentication failure of type "eauth" occurred for '
+                                           'user {0}.'.format(username)}
+                return ret
+
+            auth_list = self.get_auth_list(load)
+        elif auth_type == 'user':
+            if not self.authenticate_key(load, key):
+                if show_username:
+                    msg = 'Authentication failure of type "user" occurred for user {0}.'.format(username)
+                else:
+                    msg = 'Authentication failure of type "user" occurred'
+                ret['error'] = {'name': 'UserAuthenticationError', 'message': msg}
+                return ret
+        else:
+            ret['error'] = {'name': 'SaltInvocationError',
+                            'message': 'Authentication type not supported.'}
+            return ret
+
+        # Authentication checks passed
+        ret['auth_list'] = auth_list
+        return ret
 
 
 class Authorize(object):
@@ -173,6 +479,13 @@ class Authorize(object):
     The authorization engine used by EAUTH
     '''
     def __init__(self, opts, load, loadauth=None):
+        salt.utils.versions.warn_until(
+            'Neon',
+            'The \'Authorize\' class has been deprecated. Please use the '
+            '\'LoadAuth\', \'Reslover\', or \'AuthUser\' classes instead. '
+            'Support for the \'Authorze\' class will be removed in Salt '
+            '{version}.'
+        )
         self.opts = salt.config.master_config(opts['conf_file'])
         self.load = load
         self.ckminions = salt.utils.minions.CkMinions(opts)
@@ -181,11 +494,62 @@ class Authorize(object):
         else:
             self.loadauth = loadauth
 
+    @property
     def auth_data(self):
         '''
-        Gather and create the autorization data sets
+        Gather and create the authorization data sets
+
+        We're looking at several constructs here.
+
+        Standard eauth: allow jsmith to auth via pam, and execute any command
+        on server web1
+        external_auth:
+          pam:
+            jsmith:
+              - web1:
+                - .*
+
+        Django eauth: Import the django library, dynamically load the Django
+        model called 'model'.  That model returns a data structure that
+        matches the above for standard eauth.  This is what determines
+        who can do what to which machines
+
+        django:
+          ^model:
+            <stuff returned from django>
+
+        Active Directory Extended:
+
+        Users in the AD group 'webadmins' can run any command on server1
+        Users in the AD group 'webadmins' can run test.ping and service.restart
+        on machines that have a computer object in the AD 'webservers' OU
+        Users in the AD group 'webadmins' can run commands defined in the
+        custom attribute (custom attribute not implemented yet, this is for
+        future use)
+          ldap:
+             webadmins%:  <all users in the AD 'webadmins' group>
+               - server1:
+                   - .*
+               - ldap(OU=webservers,dc=int,dc=bigcompany,dc=com):
+                  - test.ping
+                  - service.restart
+               - ldap(OU=Domain Controllers,dc=int,dc=bigcompany,dc=com):
+                 - allowed_fn_list_attribute^
         '''
         auth_data = self.opts['external_auth']
+        merge_lists = self.opts['pillar_merge_lists']
+
+        if 'django' in auth_data and '^model' in auth_data['django']:
+            auth_from_django = salt.auth.django.retrieve_auth_entries()
+            auth_data = salt.utils.dictupdate.merge(auth_data,
+                                                    auth_from_django,
+                                                    strategy='list',
+                                                    merge_lists=merge_lists)
+
+        if 'ldap' in auth_data and __opts__.get('auth.ldap.activedirectory', False):
+            auth_data['ldap'] = salt.auth.ldap.__expand_ldap_entries(auth_data['ldap'])
+            log.debug(auth_data['ldap'])
+
         #for auth_back in self.opts.get('external_auth_sources', []):
         #    fstr = '{0}.perms'.format(auth_back)
         #    if fstr in self.loadauth.auth:
@@ -251,8 +615,18 @@ class Authorize(object):
                 form,
                 sub_auth[name] if name in sub_auth else sub_auth['*'],
                 load.get('fun', None),
+                load.get('arg', None),
                 load.get('tgt', None),
                 load.get('tgt_type', 'glob'))
+
+        # Handle possible return of dict data structure from any_auth call to
+        # avoid a stacktrace. As mentioned in PR #43181, this entire class is
+        # dead code and is marked for removal in Salt Neon. But until then, we
+        # should handle the dict return, which is an error and should return
+        # False until this class is removed.
+        if isinstance(good, dict):
+            return False
+
         if not good:
             # Accept find_job so the CLI will function cleanly
             if load.get('fun', '') != 'saltutil.find_job':
@@ -263,28 +637,28 @@ class Authorize(object):
         '''
         Determine what type of authentication is being requested and pass
         authorization
+
+        Note: this will check that the user has at least one right that will let
+        the user execute "load", this does not deal with conflicting rules
         '''
-        adata = self.auth_data()
+
+        adata = self.auth_data
         good = False
         if load.get('token', False):
-            good = False
-            for sub_auth in self.token(adata, load):
+            for sub_auth in self.token(self.auth_data, load):
                 if sub_auth:
                     if self.rights_check(
                             form,
-                            adata[sub_auth['token']['eauth']],
+                            self.auth_data[sub_auth['token']['eauth']],
                             sub_auth['token']['name'],
                             load,
                             sub_auth['token']['eauth']):
-                        good = True
-            if not good:
-                log.warning(
-                    'Authentication failure of type "token" occurred.'
-                )
-                return False
+                        return True
+            log.warning(
+                'Authentication failure of type "token" occurred.'
+            )
         elif load.get('eauth'):
-            good = False
-            for sub_auth in self.eauth(adata, load):
+            for sub_auth in self.eauth(self.auth_data, load):
                 if sub_auth:
                     if self.rights_check(
                             form,
@@ -292,13 +666,11 @@ class Authorize(object):
                             sub_auth['name'],
                             load,
                             load['eauth']):
-                        good = True
-            if not good:
-                log.warning(
-                    'Authentication failure of type "eauth" occurred.'
-                )
-                return False
-        return good
+                        return True
+            log.warning(
+                'Authentication failure of type "eauth" occurred.'
+            )
+        return False
 
 
 class Resolver(object):
@@ -311,13 +683,18 @@ class Resolver(object):
         self.auth = salt.loader.auth(opts)
 
     def _send_token_request(self, load):
-        sreq = salt.payload.SREQ(
-                'tcp://{0}:{1}'.format(
-                    salt.utils.ip_bracket(self.opts['interface']),
-                    self.opts['ret_port'])
-            )
-        tdata = sreq.send('clear', load)
-        return tdata
+        if self.opts['transport'] in ('zeromq', 'tcp'):
+            master_uri = 'tcp://' + salt.utils.ip_bracket(self.opts['interface']) + \
+                         ':' + str(self.opts['ret_port'])
+            channel = salt.transport.client.ReqChannel.factory(self.opts,
+                                                                crypt='clear',
+                                                                master_uri=master_uri)
+            return channel.send(load)
+
+        elif self.opts['transport'] == 'raet':
+            channel = salt.transport.client.ReqChannel.factory(self.opts)
+            channel.dst = (None, None, 'local_cmd')
+            return channel.send(load)
 
     def cli(self, eauth):
         '''
@@ -341,12 +718,16 @@ class Resolver(object):
             elif arg.startswith('pass'):
                 ret[arg] = getpass.getpass('{0}: '.format(arg))
             else:
-                ret[arg] = raw_input('{0}: '.format(arg))
-        for kwarg, default in args['kwargs'].items():
+                ret[arg] = input('{0}: '.format(arg))
+        for kwarg, default in list(args['kwargs'].items()):
             if kwarg in self.opts:
                 ret['kwarg'] = self.opts[kwarg]
             else:
-                ret[kwarg] = raw_input('{0} [{1}]: '.format(kwarg, default))
+                ret[kwarg] = input('{0} [{1}]: '.format(kwarg, default))
+
+        # Use current user if empty
+        if 'username' in ret and not ret['username']:
+            ret['username'] = salt.utils.get_user()
 
         return ret
 
@@ -360,14 +741,12 @@ class Resolver(object):
         tdata = self._send_token_request(load)
         if 'token' not in tdata:
             return tdata
-        oldmask = os.umask(0177)
         try:
-            with salt.utils.fopen(self.opts['token_file'], 'w+') as fp_:
-                fp_.write(tdata['token'])
+            with salt.utils.files.set_umask(0o177):
+                with salt.utils.files.fopen(self.opts['token_file'], 'w+') as fp_:
+                    fp_.write(tdata['token'])
         except (IOError, OSError):
             pass
-        finally:
-            os.umask(oldmask)
         return tdata
 
     def mk_token(self, load):
@@ -387,3 +766,43 @@ class Resolver(object):
         load['cmd'] = 'get_token'
         tdata = self._send_token_request(load)
         return tdata
+
+
+class AuthUser(object):
+    '''
+    Represents a user requesting authentication to the salt master
+    '''
+
+    def __init__(self, user):
+        '''
+        Instantiate an AuthUser object.
+
+        Takes a user to reprsent, as a string.
+        '''
+        self.user = user
+
+    def is_sudo(self):
+        '''
+        Determines if the user is running with sudo
+
+        Returns True if the user is running with sudo and False if the
+        user is not running with sudo
+        '''
+        return self.user.startswith('sudo_')
+
+    def is_running_user(self):
+        '''
+        Determines if the user is the same user as the one running
+        this process
+
+        Returns True if the user is the same user as the one running
+        this process and False if not.
+        '''
+        return self.user == salt.utils.get_user()
+
+    def sudo_name(self):
+        '''
+        Returns the username of the sudoer, i.e. self.user without the
+        'sudo_' prefix.
+        '''
+        return self.user.split('_', 1)[-1]

@@ -2,18 +2,19 @@
 '''
 Module for gathering and managing information about MooseFS
 '''
+from __future__ import absolute_import
 
 # Import salt libs
-import salt.utils
+import salt.utils.path
 
 
 def __virtual__():
     '''
     Only load if the mfs commands are installed
     '''
-    if salt.utils.which('mfsgetgoal'):
+    if salt.utils.path.which('mfsgetgoal'):
         return 'moosefs'
-    return False
+    return (False, 'The moosefs execution module cannot be loaded: the mfsgetgoal binary is not in the path.')
 
 
 def dirinfo(path, opts=None):
@@ -31,7 +32,7 @@ def dirinfo(path, opts=None):
     if opts:
         cmd += ' -' + opts
     cmd += ' ' + path
-    out = __salt__['cmd.run_all'](cmd)
+    out = __salt__['cmd.run_all'](cmd, python_shell=False)
 
     output = out['stdout'].splitlines()
     for line in output:
@@ -55,7 +56,7 @@ def fileinfo(path):
     cmd = 'mfsfileinfo ' + path
     ret = {}
     chunknum = ''
-    out = __salt__['cmd.run_all'](cmd)
+    out = __salt__['cmd.run_all'](cmd, python_shell=False)
 
     output = out['stdout'].splitlines()
     for line in output:
@@ -141,7 +142,7 @@ def getgoal(path, opts=None):
     else:
         opts = ''
     cmd += ' ' + path
-    out = __salt__['cmd.run_all'](cmd)
+    out = __salt__['cmd.run_all'](cmd, python_shell=False)
 
     output = out['stdout'].splitlines()
     if 'r' not in opts:

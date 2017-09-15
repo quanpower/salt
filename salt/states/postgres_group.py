@@ -10,11 +10,11 @@ The postgres_group module is used to create and manage Postgres groups.
     frank:
       postgres_group.present
 '''
+from __future__ import absolute_import
 
 # Import Python libs
 
 # Import salt libs
-import salt.utils
 import logging
 
 # Salt imports
@@ -28,7 +28,9 @@ def __virtual__():
     '''
     Only load if the postgres module is present
     '''
-    return 'postgres.group_create' in __salt__
+    if 'postgres.group_create' not in __salt__:
+        return (False, 'Unable to load postgres module.  Make sure `postgres.bins_dir` is set.')
+    return True
 
 
 def present(name,
@@ -41,8 +43,8 @@ def present(name,
             login=None,
             replication=None,
             password=None,
+            refresh_password=None,
             groups=None,
-            runas=None,
             user=None,
             maintenance_db=None,
             db_password=None,
@@ -52,7 +54,7 @@ def present(name,
     '''
     Ensure that the named group is present with the specified privileges
     Please note that the user/group notion in postgresql is just abstract, we
-    have roles, where users can be seens as roles with the LOGIN privilege
+    have roles, where users can be seen as roles with the ``LOGIN`` privilege
     and groups the others.
 
     name
@@ -84,22 +86,28 @@ def present(name,
         Should the new group be allowed to initiate streaming replication
 
     password
-        The Group's password
+        The group's password
         It can be either a plain string or a md5 postgresql hashed password::
 
             'md5{MD5OF({password}{role}}'
 
-        If encrypted is None or True, the password will be automatically
-        encrypted to the previous
-        format if it is not already done.
+        If encrypted is ``None`` or ``True``, the password will be automatically
+        encrypted to the previous format if it is not already done.
+
+    refresh_password
+        Password refresh flag
+
+        Boolean attribute to specify whether to password comparison check
+        should be performed.
+
+        If refresh_password is ``True``, the password will be automatically
+        updated without extra password change check.
+
+        This behaviour makes it possible to execute in environments without
+        superuser access available, e.g. Amazon RDS for PostgreSQL
 
     groups
         A string of comma separated groups the group should be in
-
-    runas
-        System user all operations should be performed on behalf of
-
-        .. deprecated:: 0.17.0
 
     user
         System user all operations should be performed on behalf of
@@ -107,7 +115,7 @@ def present(name,
         .. versionadded:: 0.17.0
 
     db_user
-        database username if different from config or defaul
+        database username if different from config or default
 
     db_password
         user password if any password for a specified user
@@ -123,39 +131,15 @@ def present(name,
            'result': True,
            'comment': 'Group {0} is already present'.format(name)}
 
-    salt.utils.warn_until(
-        'Lithium',
-        'Please remove \'runas\' support at this stage. \'user\' support was '
-        'added in 0.17.0',
-        _dont_call_warnings=True
-    )
     if createuser:
         createroles = True
     # default to encrypted passwords
     if encrypted is not False:
         encrypted = postgres._DEFAULT_PASSWORDS_ENCRYPTION
-    # maybe encrypt if if not already and necessary
+    # maybe encrypt if it's not already and necessary
     password = postgres._maybe_encrypt_password(name,
                                                 password,
                                                 encrypted=encrypted)
-    if runas:
-        # Warn users about the deprecation
-        ret.setdefault('warnings', []).append(
-            'The \'runas\' argument is being deprecated in favor of \'user\', '
-            'please update your state files.'
-        )
-    if user is not None and runas is not None:
-        # user wins over runas but let warn about the deprecation.
-        ret.setdefault('warnings', []).append(
-            'Passed both the \'runas\' and \'user\' arguments. Please don\'t. '
-            '\'runas\' is being ignored in favor of \'user\'.'
-        )
-        runas = None
-    elif runas is not None:
-        # Support old runas usage
-        user = runas
-        runas = None
-
     db_args = {
         'maintenance_db': maintenance_db,
         'runas': user,
@@ -168,7 +152,7 @@ def present(name,
     # check if group exists
     mode = 'create'
     group_attr = __salt__['postgres.role_get'](
-        name, return_password=True, **db_args)
+        name, return_password=not refresh_password, **db_args)
     if group_attr is not None:
         mode = 'update'
 
@@ -200,7 +184,7 @@ def present(name,
             update['replication'] = replication
         if superuser is not None and group_attr['superuser'] != superuser:
             update['superuser'] = superuser
-        if password is not None and group_attr['password'] != password:
+        if password is not None and (refresh_password or group_attr['password'] != password):
             update['password'] = True
     if mode == 'create' or (mode == 'update' and update):
         if __opts__['test']:
@@ -237,7 +221,6 @@ def present(name,
 
 
 def absent(name,
-           runas=None,
            user=None,
            maintenance_db=None,
            db_password=None,
@@ -249,11 +232,6 @@ def absent(name,
 
     name
         The groupname of the group to remove
-
-    runas
-        System user all operations should be performed on behalf of
-
-        .. deprecated:: 0.17.0
 
     user
         System user all operations should be performed on behalf of
@@ -276,30 +254,6 @@ def absent(name,
            'changes': {},
            'result': True,
            'comment': ''}
-
-    salt.utils.warn_until(
-        'Lithium',
-        'Please remove \'runas\' support at this stage. \'user\' support was '
-        'added in 0.17.0',
-        _dont_call_warnings=True
-    )
-    if runas:
-        # Warn users about the deprecation
-        ret.setdefault('warnings', []).append(
-            'The \'runas\' argument is being deprecated in favor of \'user\', '
-            'please update your state files.'
-        )
-    if user is not None and runas is not None:
-        # user wins over runas but let warn about the deprecation.
-        ret.setdefault('warnings', []).append(
-            'Passed both the \'runas\' and \'user\' arguments. Please don\'t. '
-            '\'runas\' is being ignored in favor of \'user\'.'
-        )
-        runas = None
-    elif runas is not None:
-        # Support old runas usage
-        user = runas
-        runas = None
 
     db_args = {
         'maintenance_db': maintenance_db,

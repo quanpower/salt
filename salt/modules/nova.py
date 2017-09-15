@@ -12,7 +12,7 @@ Module for handling OpenStack Nova calls
         keystone.tenant: admin
         keystone.auth_url: 'http://127.0.0.1:5000/v2.0/'
         # Optional
-        keystone.region_name: 'regionOne'
+        keystone.region_name: 'RegionOne'
 
     If configuration for multiple OpenStack accounts is required, they can be
     set up as different configuration profiles:
@@ -35,13 +35,33 @@ Module for handling OpenStack Nova calls
     For example::
 
         salt '*' nova.flavor_list profile=openstack1
+
+    To use keystoneauth1 instead of keystoneclient, include the `use_keystoneauth`
+    option in the pillar or minion config.
+
+    .. note:: this is required to use keystone v3 as for authentication.
+
+    .. code-block:: yaml
+
+        keystone.user: admin
+        keystone.password: verybadpass
+        keystone.tenant: admin
+        keystone.auth_url: 'http://127.0.0.1:5000/v3/'
+        keystone.use_keystoneauth: true
+        keystone.verify: '/path/to/custom/certs/ca-bundle.crt'
+
+
+    Note: by default the nova module will attempt to verify its connection
+    utilizing the system certificates. If you need to verify against another bundle
+    of CA certificates or want to skip verification altogether you will need to
+    specify the `verify` option. You can specify True or False to verify (or not)
+    against system certificates, a path to a bundle or CA certs to check against, or
+    None to allow keystoneauth to search for the certificates on its own.(defaults to True)
 '''
+from __future__ import absolute_import
 
 # Import python libs
 import logging
-
-# Import salt libs
-import salt.utils.openstack.nova as suon
 
 
 # Get logging started
@@ -52,13 +72,19 @@ __func_alias__ = {
     'list_': 'list'
 }
 
+try:
+    import salt.utils.openstack.nova as suon
+    HAS_NOVA = True
+except NameError as exc:
+    HAS_NOVA = False
+
 
 def __virtual__():
     '''
     Only load this module if nova
     is installed on this minion.
     '''
-    return suon.check_nova()
+    return HAS_NOVA
 
 
 __opts__ = {}
@@ -77,6 +103,8 @@ def _auth(profile=None):
         region_name = credentials.get('keystone.region_name', None)
         api_key = credentials.get('keystone.api_key', None)
         os_auth_system = credentials.get('keystone.os_auth_system', None)
+        use_keystoneauth = credentials.get('keystone.use_keystoneauth', False)
+        verify = credentials.get('keystone.verify', None)
     else:
         user = __salt__['config.option']('keystone.user')
         password = __salt__['config.option']('keystone.password')
@@ -85,14 +113,34 @@ def _auth(profile=None):
         region_name = __salt__['config.option']('keystone.region_name')
         api_key = __salt__['config.option']('keystone.api_key')
         os_auth_system = __salt__['config.option']('keystone.os_auth_system')
-    kwargs = {
-        'username': user,
-        'password': password,
-        'api_key': api_key,
-        'project_id': tenant,
-        'auth_url': auth_url,
-        'region_name': region_name
-    }
+        use_keystoneauth = __salt__['config.option']('keystone.use_keystoneauth')
+        verify = __salt__['config.option']('keystone.verify')
+
+    if use_keystoneauth is True:
+        project_domain_name = credentials['keystone.project_domain_name']
+        user_domain_name = credentials['keystone.user_domain_name']
+
+        kwargs = {
+            'username': user,
+            'password': password,
+            'project_id': tenant,
+            'auth_url': auth_url,
+            'region_name': region_name,
+            'use_keystoneauth': use_keystoneauth,
+            'verify': verify,
+            'project_domain_name': project_domain_name,
+            'user_domain_name': user_domain_name
+        }
+    else:
+        kwargs = {
+            'username': user,
+            'password': password,
+            'api_key': api_key,
+            'project_id': tenant,
+            'auth_url': auth_url,
+            'region_name': region_name,
+            'os_auth_plugin': os_auth_system
+        }
 
     return suon.SaltNova(**kwargs)
 
@@ -114,7 +162,7 @@ def boot(name, flavor_id=0, image_id=0, profile=None, timeout=300):
         How long to wait, after creating the instance, for the provider to
         return information about it (default 300 seconds).
 
-        .. versionadded:: 2014.1.0 (Hydrogen)
+        .. versionadded:: 2014.1.0
 
     CLI Example:
 
@@ -554,6 +602,12 @@ def list_(profile=None):
     '''
     To maintain the feel of the nova command line, this function simply calls
     the server_list function.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' nova.list
     '''
     return server_list(profile=profile)
 
@@ -566,7 +620,7 @@ def server_list(profile=None):
 
     .. code-block:: bash
 
-        salt '*' nova.show
+        salt '*' nova.server_list
     '''
     conn = _auth(profile)
     return conn.server_list()

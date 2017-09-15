@@ -2,10 +2,11 @@
 '''
 Module for gathering and managing bridging information
 '''
+from __future__ import absolute_import
 
 import sys
 import re
-import salt.utils
+import salt.utils.path
 
 
 __func_alias__ = {
@@ -30,16 +31,17 @@ def __virtual__():
     }
     cur_os = __grains__['kernel']
     for _os in supported_os_tool:
-        if cur_os == _os and salt.utils.which(supported_os_tool[cur_os]):
+        if cur_os == _os and salt.utils.path.which(supported_os_tool[cur_os]):
             return True
-    return False
+    return (False, 'The bridge execution module failed to load: requires one of the following tool/os'
+        ' combinations: ifconfig on FreeBSD/OpenBSD, brctl on Linux or brconfig on NetBSD.')
 
 
 def _tool_path(ostool):
     '''
     Internal, returns tools path
     '''
-    return salt.utils.which(ostool)
+    return salt.utils.path.which(ostool)
 
 
 def _linux_brshow(br=None):
@@ -55,7 +57,7 @@ def _linux_brshow(br=None):
 
     brs = {}
 
-    for line in __salt__['cmd.run'](cmd).splitlines():
+    for line in __salt__['cmd.run'](cmd, python_shell=False).splitlines():
         # get rid of first line
         if line.startswith('bridge name'):
             continue
@@ -94,7 +96,8 @@ def _linux_bradd(br):
     Internal, creates the bridge
     '''
     brctl = _tool_path('brctl')
-    return __salt__['cmd.run']('{0} addbr {1}'.format(brctl, br))
+    return __salt__['cmd.run']('{0} addbr {1}'.format(brctl, br),
+                               python_shell=False)
 
 
 def _linux_brdel(br):
@@ -102,7 +105,8 @@ def _linux_brdel(br):
     Internal, deletes the bridge
     '''
     brctl = _tool_path('brctl')
-    return __salt__['cmd.run']('{0} delbr {1}'.format(brctl, br))
+    return __salt__['cmd.run']('{0} delbr {1}'.format(brctl, br),
+                               python_shell=False)
 
 
 def _linux_addif(br, iface):
@@ -110,7 +114,8 @@ def _linux_addif(br, iface):
     Internal, adds an interface to a bridge
     '''
     brctl = _tool_path('brctl')
-    return __salt__['cmd.run']('{0} addif {1} {2}'.format(brctl, br, iface))
+    return __salt__['cmd.run']('{0} addif {1} {2}'.format(brctl, br, iface),
+                               python_shell=False)
 
 
 def _linux_delif(br, iface):
@@ -118,7 +123,8 @@ def _linux_delif(br, iface):
     Internal, removes an interface from a bridge
     '''
     brctl = _tool_path('brctl')
-    return __salt__['cmd.run']('{0} delif {1} {2}'.format(brctl, br, iface))
+    return __salt__['cmd.run']('{0} delif {1} {2}'.format(brctl, br, iface),
+                               python_shell=False)
 
 
 def _linux_stp(br, state):
@@ -126,7 +132,8 @@ def _linux_stp(br, state):
     Internal, sets STP state
     '''
     brctl = _tool_path('brctl')
-    return __salt__['cmd.run']('{0} stp {1} {2}'.format(brctl, br, state))
+    return __salt__['cmd.run']('{0} stp {1} {2}'.format(brctl, br, state),
+                               python_shell=False)
 
 
 def _bsd_brshow(br=None):
@@ -144,14 +151,14 @@ def _bsd_brshow(br=None):
         ifaces[br] = br
     else:
         cmd = '{0} -g bridge'.format(ifconfig)
-        for line in __salt__['cmd.run'](cmd).splitlines():
+        for line in __salt__['cmd.run'](cmd, python_shell=False).splitlines():
             ifaces[line] = line
 
     brs = {}
 
     for iface in ifaces:
         cmd = '{0} {1}'.format(ifconfig, iface)
-        for line in __salt__['cmd.run'](cmd).splitlines():
+        for line in __salt__['cmd.run'](cmd, python_shell=False).splitlines():
             brs[iface] = {
                 'interfaces': [],
                 'stp': 'no'
@@ -181,7 +188,7 @@ def _netbsd_brshow(br=None):
     brs = {}
     start_int = False
 
-    for line in __salt__['cmd.run'](cmd).splitlines():
+    for line in __salt__['cmd.run'](cmd, python_shell=False).splitlines():
         if line.startswith('bridge'):
             start_int = False
             brname = line.split(':')[0]  # on NetBSD, always ^bridge([0-9]+):
@@ -217,13 +224,15 @@ def _bsd_bradd(br):
     if not br:
         return False
 
-    if __salt__['cmd.retcode']('{0} {1} create up'.format(ifconfig, br)) != 0:
+    if __salt__['cmd.retcode']('{0} {1} create up'.format(ifconfig, br),
+                               python_shell=False) != 0:
         return False
 
     # NetBSD is two cmds
     if kernel == 'NetBSD':
         brconfig = _tool_path('brconfig')
-        if __salt__['cmd.retcode']('{0} {1} up'.format(brconfig, br)) != 0:
+        if __salt__['cmd.retcode']('{0} {1} up'.format(brconfig, br),
+                                   python_shell=False) != 0:
             return False
 
     return True
@@ -236,7 +245,8 @@ def _bsd_brdel(br):
     ifconfig = _tool_path('ifconfig')
     if not br:
         return False
-    return __salt__['cmd.run']('{0} {1} destroy'.format(ifconfig, br))
+    return __salt__['cmd.run']('{0} {1} destroy'.format(ifconfig, br),
+                               python_shell=False)
 
 
 def _bsd_addif(br, iface):
@@ -254,8 +264,8 @@ def _bsd_addif(br, iface):
     if not br or not iface:
         return False
 
-    return __salt__['cmd.run']('{0} {1} {2} {3}'.
-                                format(cmd, br, brcmd, iface))
+    return __salt__['cmd.run']('{0} {1} {2} {3}'.format(cmd, br, brcmd, iface),
+                               python_shell=False)
 
 
 def _bsd_delif(br, iface):
@@ -273,8 +283,8 @@ def _bsd_delif(br, iface):
     if not br or not iface:
         return False
 
-    return __salt__['cmd.run']('{0} {1} {2} {3}'.
-                                format(cmd, br, brcmd, iface))
+    return __salt__['cmd.run']('{0} {1} {2} {3}'.format(cmd, br, brcmd, iface),
+                               python_shell=False)
 
 
 def _bsd_stp(br, state, iface):
@@ -291,8 +301,8 @@ def _bsd_stp(br, state, iface):
     if not br or not iface:
         return False
 
-    return __salt__['cmd.run']('{0} {1} {2} {3}'.
-                                format(cmd, br, state, iface))
+    return __salt__['cmd.run']('{0} {1} {2} {3}'.format(cmd, br, state, iface),
+                               python_shell=False)
 
 
 def _os_dispatch(func, *args, **kwargs):

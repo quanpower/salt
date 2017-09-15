@@ -2,10 +2,12 @@
 '''
 Module for viewing and modifying sysctl parameters
 '''
+from __future__ import absolute_import
+import os
 import re
 
 # Import salt libs
-import salt.utils
+import salt.utils.files
 from salt.exceptions import CommandExecutionError
 
 # Define the module's virtual name
@@ -16,10 +18,13 @@ def __virtual__():
     '''
     Only run on NetBSD systems
     '''
-    return __virtualname__ if __grains__['os'] == 'NetBSD' else False
+    if __grains__['os'] == 'NetBSD':
+        return __virtualname__
+    return (False, 'The netbsd_sysctl execution module failed to load: '
+            'only available on NetBSD.')
 
 
-def show():
+def show(config_file=False):
     '''
     Return a list of sysctl parameters for this minion
 
@@ -69,7 +74,7 @@ def get(name):
         salt '*' sysctl.get hw.physmem
     '''
     cmd = 'sysctl -n {0}'.format(name)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
     return out
 
 
@@ -85,7 +90,7 @@ def assign(name, value):
     '''
     ret = {}
     cmd = 'sysctl -w {0}="{1}"'.format(name, value)
-    data = __salt__['cmd.run_all'](cmd)
+    data = __salt__['cmd.run_all'](cmd, python_shell=False)
 
     if data['retcode'] != 0:
         raise CommandExecutionError('sysctl failed: {0}'.format(
@@ -95,7 +100,7 @@ def assign(name, value):
     return ret
 
 
-def persist(name, value):
+def persist(name, value, config='/etc/sysctl.conf'):
     '''
     Assign and persist a simple sysctl parameter for this minion
 
@@ -108,9 +113,17 @@ def persist(name, value):
     nlines = []
     edited = False
     value = str(value)
-    config = '/etc/sysctl.conf'
 
-    with salt.utils.fopen(config, 'r') as ifile:
+    # create /etc/sysctl.conf if not present
+    if not os.path.isfile(config):
+        try:
+            with salt.utils.files.fopen(config, 'w+'):
+                pass
+        except (IOError, OSError):
+            msg = 'Could not create {0}'
+            raise CommandExecutionError(msg.format(config))
+
+    with salt.utils.files.fopen(config, 'r') as ifile:
         for line in ifile:
             m = re.match(r'{0}(\??=)'.format(name), line)
             if not m:
@@ -132,10 +145,10 @@ def persist(name, value):
                 edited = True
 
     if not edited:
-        newline = '{0}{1}{2}'.format(name, m.group(1), value)
+        newline = '{0}={1}'.format(name, value)
         nlines.append("{0}\n".format(newline))
 
-    with salt.utils.fopen(config, 'w+') as ofile:
+    with salt.utils.files.fopen(config, 'w+') as ofile:
         ofile.writelines(nlines)
 
     assign(name, value)

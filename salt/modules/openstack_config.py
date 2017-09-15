@@ -8,11 +8,12 @@ Modify, retrieve, or delete values from OpenStack configuration files.
 :platform: linux
 
 '''
+from __future__ import absolute_import
 # Import Salt libs
 import salt.utils
 import salt.exceptions
 
-from salt.utils.decorators import which as _which
+import salt.utils.decorators.path
 
 import shlex
 try:
@@ -44,7 +45,7 @@ def _fallback(*args, **kw):
     return 'The "openstack-config" command needs to be installed for this function to work.  Typically this is included in the "openstack-utils" package.'
 
 
-@_which('openstack-config')
+@salt.utils.decorators.path.which('openstack-config')
 def set_(filename, section, parameter, value):
     '''
     Set a value in an OpenStack configuration file.
@@ -71,12 +72,13 @@ def set_(filename, section, parameter, value):
     filename = _quote(filename)
     section = _quote(section)
     parameter = _quote(parameter)
-    value = _quote(value)
+    value = _quote(str(value))
 
     result = __salt__['cmd.run_all'](
             'openstack-config --set {0} {1} {2} {3}'.format(
                 filename, section, parameter, value
-                )
+                ),
+            python_shell=False,
             )
 
     if result['retcode'] == 0:
@@ -85,7 +87,7 @@ def set_(filename, section, parameter, value):
         raise salt.exceptions.CommandExecutionError(result['stderr'])
 
 
-@_which('openstack-config')
+@salt.utils.decorators.path.which('openstack-config')
 def get(filename, section, parameter):
     '''
     Get a value from an OpenStack configuration file.
@@ -114,7 +116,8 @@ def get(filename, section, parameter):
     result = __salt__['cmd.run_all'](
             'openstack-config --get {0} {1} {2}'.format(
                 filename, section, parameter
-                )
+                ),
+            python_shell=False,
             )
 
     if result['retcode'] == 0:
@@ -123,7 +126,7 @@ def get(filename, section, parameter):
         raise salt.exceptions.CommandExecutionError(result['stderr'])
 
 
-@_which('openstack-config')
+@salt.utils.decorators.path.which('openstack-config')
 def delete(filename, section, parameter):
     '''
     Delete a value from an OpenStack configuration file.
@@ -151,7 +154,8 @@ def delete(filename, section, parameter):
     result = __salt__['cmd.run_all'](
             'openstack-config --del {0} {1} {2}'.format(
                 filename, section, parameter
-                )
+                ),
+            python_shell=False,
             )
 
     if result['retcode'] == 0:

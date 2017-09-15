@@ -1,11 +1,26 @@
 # -*- coding: utf-8 -*-
 '''
 The service module for OpenBSD
+
+.. important::
+    If you feel that Salt should be using this module to manage services on a
+    minion, and it is using a different module (or gives an error similar to
+    *'service.start' is not available*), see :ref:`here
+    <module-provider-override>`.
 '''
 
 # Import python libs
+from __future__ import absolute_import
 import os
+import fnmatch
 import logging
+
+# Import 3rd-party libs
+from salt.ext import six
+from salt.ext.six.moves import map  # pylint: disable=import-error,redefined-builtin
+
+# Import Salt libs
+import salt.utils.files
 
 log = logging.getLogger(__name__)
 
@@ -24,12 +39,15 @@ def __virtual__():
     Only work on OpenBSD
     '''
     if __grains__['os'] == 'OpenBSD' and os.path.exists('/etc/rc.d/rc.subr'):
-        krel = map(int, __grains__['kernelrelease'].split('.'))
+        krel = list(list(map(int, __grains__['kernelrelease'].split('.'))))
         # The -f flag, used to force a script to run even if disabled,
         # was added after the 5.0 release.
+        # the rcctl(8) command is the preferred way to manage services.
         if krel[0] > 5 or (krel[0] == 5 and krel[1] > 0):
-            return __virtualname__
-    return False
+            if not os.path.exists('/usr/sbin/rcctl'):
+                return __virtualname__
+    return (False, 'The openbsdservice execution module cannot be loaded: '
+            'only available on OpenBSD systems.')
 
 
 def start(name):
@@ -76,24 +94,47 @@ def restart(name):
 
 def status(name, sig=None):
     '''
-    Return the status for a service, returns a bool whether the service is
-    running.
+    Return the status for a service.
+    If the name contains globbing, a dict mapping service name to True/False
+    values is returned.
+
+    .. versionchanged:: Oxygen
+        The service name can now be a glob (e.g. ``salt*``)
+
+    Args:
+        name (str): The name of the service to check
+        sig (str): Signature to use to find the service via ps
+
+    Returns:
+        bool: True if running, False otherwise
+        dict: Maps service name to True if running, False otherwise
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' service.status <service name>
+        salt '*' service.status <service name> [service signature]
     '''
     if sig:
         return bool(__salt__['status.pid'](sig))
-    cmd = '/etc/rc.d/{0} -f check'.format(name)
-    return not __salt__['cmd.retcode'](cmd)
+
+    contains_globbing = bool(re.search(r'\*|\?|\[.+\]', name))
+    if contains_globbing:
+        services = fnmatch.filter(get_all(), name)
+    else:
+        services = [name]
+    results = {}
+    for service in services:
+        cmd = '/etc/rc.d/{0} -f check'.format(service)
+        results[service] = not __salt__['cmd.retcode'](cmd, ignore_retcode=True)
+    if contains_globbing:
+        return results
+    return results[name]
 
 
 def reload_(name):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Reload the named service
 
@@ -127,7 +168,7 @@ def _get_rc():
     try:
         # now read the system startup script /etc/rc
         # to know what are the system enabled daemons
-        with open('/etc/rc', 'r') as handle:
+        with salt.utils.files.fopen('/etc/rc', 'r') as handle:
             lines = handle.readlines()
     except IOError:
         log.error('Unable to read /etc/rc')
@@ -145,7 +186,10 @@ def _get_rc():
 
     # this will execute rc.conf and rc.conf.local
     # used in /etc/rc at boot to start the daemons
-    variables = __salt__['cmd.run']('(. /etc/rc.conf && set)', clean_env=True, output_loglevel='quiet').split('\n')
+    variables = __salt__['cmd.run']('(. /etc/rc.conf && set)',
+                                    clean_env=True,
+                                    output_loglevel='quiet',
+                                    python_shell=True).split('\n')
     for var in variables:
         match = service_flags_regex.match(var)
         if match:
@@ -168,7 +212,7 @@ def _get_rc():
 
 def available(name):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Returns ``True`` if the specified service is available, otherwise returns
     ``False``.
@@ -185,7 +229,7 @@ def available(name):
 
 def missing(name):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     The inverse of service.available.
     Returns ``True`` if the specified service is not available, otherwise returns
@@ -202,7 +246,7 @@ def missing(name):
 
 def get_all():
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Return all available boot services
 
@@ -224,7 +268,7 @@ def get_all():
 
 def get_enabled():
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Return a list of service that are enabled on boot
 
@@ -235,15 +279,15 @@ def get_enabled():
         salt '*' service.get_enabled
     '''
     services = []
-    for daemon, is_enabled in _get_rc().items():
+    for daemon, is_enabled in six.iteritems(_get_rc()):
         if is_enabled:
             services.append(daemon)
     return sorted(set(get_all()) & set(services))
 
 
-def enabled(name):
+def enabled(name, **kwargs):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Return True if the named service is enabled, false otherwise
 
@@ -258,7 +302,7 @@ def enabled(name):
 
 def get_disabled():
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Return a set of services that are installed but disabled
 
@@ -269,7 +313,7 @@ def get_disabled():
         salt '*' service.get_disabled
     '''
     services = []
-    for daemon, is_enabled in _get_rc().items():
+    for daemon, is_enabled in six.iteritems(_get_rc()):
         if not is_enabled:
             services.append(daemon)
     return sorted(set(get_all()) & set(services))
@@ -277,7 +321,7 @@ def get_disabled():
 
 def disabled(name):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Return True if the named service is disabled, false otherwise
 

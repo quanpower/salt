@@ -1,23 +1,37 @@
 # -*- coding: utf-8 -*-
 '''
 Pkgutil support for Solaris
+
+.. important::
+    If you feel that Salt should be using this module to manage packages on a
+    minion, and it is using a different module (or gives an error similar to
+    *'pkg.install' is not available*), see :ref:`here
+    <module-provider-override>`.
 '''
+from __future__ import absolute_import
 
 # Import python libs
 import copy
 
 # Import salt libs
 import salt.utils
+import salt.utils.pkg
+import salt.utils.versions
 from salt.exceptions import CommandExecutionError, MinionError
+from salt.ext import six
+
+# Define the module's virtual name
+__virtualname__ = 'pkgutil'
 
 
 def __virtual__():
     '''
     Set the virtual pkg module if the os is Solaris
     '''
-    if __grains__['os'] == 'Solaris':
-        return 'pkgutil'
-    return False
+    if __grains__['os_family'] == 'Solaris':
+        return __virtualname__
+    return (False, 'The pkgutil execution module cannot be loaded: '
+            'only available on Solaris systems.')
 
 
 def refresh_db():
@@ -30,7 +44,9 @@ def refresh_db():
 
         salt '*' pkgutil.refresh_db
     '''
-    return __salt__['cmd.retcode']('/opt/csw/bin/pkgutil -U > /dev/null 2>&1') == 0
+    # Remove rtag file to keep multiple refreshes from happening in pkg states
+    salt.utils.pkg.clear_rtag(__opts__)
+    return __salt__['cmd.retcode']('/opt/csw/bin/pkgutil -U') == 0
 
 
 def upgrade_available(name):
@@ -44,7 +60,7 @@ def upgrade_available(name):
         salt '*' pkgutil.upgrade_available CSWpython
     '''
     version_num = None
-    cmd = '/opt/csw/bin/pkgutil -c --parse --single {0} 2>/dev/null'.format(
+    cmd = '/opt/csw/bin/pkgutil -c --parse --single {0}'.format(
         name)
     out = __salt__['cmd.run_stdout'](cmd)
     if out:
@@ -57,7 +73,7 @@ def upgrade_available(name):
     return ''
 
 
-def list_upgrades(refresh=True):
+def list_upgrades(refresh=True, **kwargs):  # pylint: disable=W0613
     '''
     List all available package upgrades on this system
 
@@ -82,7 +98,7 @@ def list_upgrades(refresh=True):
     return upgrades
 
 
-def upgrade(refresh=True, **kwargs):
+def upgrade(refresh=True):
     '''
     Upgrade all of the packages to the latest available version.
 
@@ -212,7 +228,7 @@ def latest_version(*names, **kwargs):
         if name in names:
             cver = pkgs.get(name, '')
             nver = version_rev.split(',')[0]
-            if not cver or salt.utils.compare_versions(ver1=cver,
+            if not cver or salt.utils.versions.compare(ver1=cver,
                                                        oper='<',
                                                        ver2=nver):
                 # Remove revision for version comparison
@@ -224,7 +240,7 @@ def latest_version(*names, **kwargs):
     return ret
 
 # available_version is being deprecated
-available_version = latest_version
+available_version = salt.utils.alias_function(latest_version, 'available_version')
 
 
 def install(name=None, refresh=False, version=None, pkgs=None, **kwargs):
@@ -275,7 +291,7 @@ def install(name=None, refresh=False, version=None, pkgs=None, **kwargs):
     if pkgs is None and version and len(pkg_params) == 1:
         pkg_params = {name: version}
     targets = []
-    for param, pkgver in pkg_params.iteritems():
+    for param, pkgver in six.iteritems(pkg_params):
         if pkgver is None:
             targets.append(param)
         else:

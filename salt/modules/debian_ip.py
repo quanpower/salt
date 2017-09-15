@@ -1,24 +1,34 @@
-## -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 '''
 The networking module for Debian based distros
+
+References:
+
+* http://www.debian.org/doc/manuals/debian-reference/ch05.en.html
 '''
 
 # Import python libs
+from __future__ import absolute_import
+import functools
 import logging
 import os.path
 import os
 import re
-import StringIO
 import time
 
 # Import third party libs
 import jinja2
 import jinja2.exceptions
+from salt.ext import six
+from salt.ext.six.moves import StringIO  # pylint: disable=import-error,no-name-in-module
 
 # Import salt libs
-import salt.utils
+import salt.utils.files
+import salt.utils.odict
+import salt.utils.stringutils
 import salt.utils.templates
 import salt.utils.validate.net
+
 
 # Set up logging
 log = logging.getLogger(__name__)
@@ -40,7 +50,9 @@ def __virtual__():
     '''
     if __grains__['os_family'] == 'Debian':
         return __virtualname__
-    return False
+    return (False, 'The debian_ip module could not be loaded: '
+            'unsupported OS family')
+
 
 _ETHTOOL_CONFIG_OPTS = {
     'speed': 'link-speed',
@@ -98,40 +110,44 @@ _REV_ETHTOOL_CONFIG_OPTS = {
     'hardware-dma-ring-tx': 'hardware-dma-ring-tx',
 }
 
-_DEB_CONFIG_OPTS = [
-    'domain', 'peerdns', 'defroute',
-    'mtu', 'static-routes', 'gateway', 'broadcast'
-]
-_DEB_CONFIG_BONDING_OPTS = [
-    'mode', 'miimon', 'arp_interval', 'slaves',
-    'arp_ip_target', 'downdelay', 'updelay',
-    'use_carrier', 'lacp_rate', 'hashing-algorithm',
-    'max_bonds', 'tx_queues', 'num_grat_arp',
-    'num_unsol_na', 'primary', 'primary_reselect',
-    'ad_select', 'xmit_hash_policy', 'arp_validate',
-    'fail_over_mac', 'all_slaves_active', 'resend_igmp'
-]
-_DEB_CONFIG_BRIDGEING_OPTS = [
-    'ageing', 'bridgeprio', 'fd', 'gcint',
-    'hello', 'hw', 'maxage', 'maxwait',
-    'pathcost', 'portprio', 'ports',
-    'stp', 'waitport'
-]
+_DEB_CONFIG_PPPOE_OPTS = {
+    'user': 'user',
+    'password': 'password',
+    'provider': 'provider',
+    'pppoe_iface': 'pppoe_iface',
+    'noipdefault': 'noipdefault',
+    'usepeerdns': 'usepeerdns',
+    'defaultroute': 'defaultroute',
+    'holdoff': 'holdoff',
+    'maxfail': 'maxfail',
+    'hide-password': 'hide-password',
+    'lcp-echo-interval': 'lcp-echo-interval',
+    'lcp-echo-failure': 'lcp-echo-failure',
+    'connect': 'connect',
+    'noauth': 'noauth',
+    'persist': 'persist',
+    'mtu': 'mtu',
+    'noaccomp': 'noaccomp',
+    'linkname': 'linkname',
+}
+
 _DEB_ROUTES_FILE = '/etc/network/routes'
 _DEB_NETWORK_FILE = '/etc/network/interfaces'
-_DEB_NETWORK_DIR = '/etc/network/interfaces.d'
-_DEB_NETWORK_UP_DIR = '/etc/network/if-up.d'
-_DEB_NETWORK_DOWN_DIR = '/etc/network/if-down.d'
-_DEB_NETWORK_CONF_FILES = '/etc/modprobe.d'
+_DEB_NETWORK_DIR = '/etc/network/interfaces.d/'
+_DEB_NETWORK_UP_DIR = '/etc/network/if-up.d/'
+_DEB_NETWORK_DOWN_DIR = '/etc/network/if-down.d/'
+_DEB_NETWORK_CONF_FILES = '/etc/modprobe.d/'
 _DEB_NETWORKING_FILE = '/etc/default/networking'
 _DEB_HOSTNAME_FILE = '/etc/hostname'
 _DEB_RESOLV_FILE = '/etc/resolv.conf'
+_DEB_PPP_DIR = '/etc/ppp/peers/'
 
 _CONFIG_TRUE = ['yes', 'on', 'true', '1', True]
 _CONFIG_FALSE = ['no', 'off', 'false', '0', False]
 _IFACE_TYPES = [
     'eth', 'bond', 'alias', 'clone',
-    'ipsec', 'dialup', 'bridge', 'slave', 'vlan',
+    'ipsec', 'dialup', 'bridge', 'slave',
+    'vlan', 'pppoe', 'source',
 ]
 
 
@@ -201,11 +217,11 @@ def _raise_error_routes(iface, option, expected):
 
 def _read_file(path):
     '''
-    Reads and returns the contents of a file
+    Reads and returns the contents of a text file
     '''
     try:
-        with salt.utils.fopen(path, 'rb') as contents:
-            return contents.readlines()
+        with salt.utils.files.flopen(path, 'rb') as contents:
+            return [salt.utils.stringutils.to_str(line) for line in contents.readlines()]
     except (OSError, IOError):
         return ''
 
@@ -214,7 +230,6 @@ def _parse_resolve():
     '''
     Parse /etc/resolv.conf and return domainname
     '''
-
     contents = _read_file(_DEB_RESOLV_FILE)
     return contents
 
@@ -223,82 +238,352 @@ def _parse_domainname():
     '''
     Parse /etc/resolv.conf and return domainname
     '''
-
     contents = _read_file(_DEB_RESOLV_FILE)
-    pattern = r'(?P<tag>\S+)\s+(?P<domain_name>\S+)'
+    pattern = r'domain\s+(?P<domain_name>\S+)'
     prog = re.compile(pattern)
     for item in contents:
         match = prog.match(item)
         if match:
-            return match.group("domain_name")
-    return ""
+            return match.group('domain_name')
+    return ''
+
+
+def _parse_searchdomain():
+    '''
+    Parse /etc/resolv.conf and return searchdomain
+    '''
+    contents = _read_file(_DEB_RESOLV_FILE)
+    pattern = r'search\s+(?P<search_domain>\S+)'
+    prog = re.compile(pattern)
+    for item in contents:
+        match = prog.match(item)
+        if match:
+            return match.group('search_domain')
+    return ''
 
 
 def _parse_hostname():
     '''
     Parse /etc/hostname and return hostname
     '''
-
     contents = _read_file(_DEB_HOSTNAME_FILE)
-    return contents[0].split('\n')[0]
+    if contents:
+        return contents[0].split('\n')[0]
+    else:
+        return ''
 
 
 def _parse_current_network_settings():
     '''
     Parse /etc/default/networking and return current configuration
     '''
+    opts = salt.utils.odict.OrderedDict()
+    opts['networking'] = ''
 
-    opts = {}
-    opts['networking'] = 'no'
-
-    if os.path.isfile('/etc/default/networking'):
-        contents = open('/etc/default/networking')
-
-        for line in contents:
-            if line.startswith('#'):
-                continue
-            elif line.startswith('CONFIGURE_INTERFACES'):
-                sline = line.split('=')
-                if line.endswith('\n'):
-                    opts['networking'] = sline[1][:-1]
-                else:
-                    opts['networking'] = sline[1]
+    if os.path.isfile(_DEB_NETWORKING_FILE):
+        with salt.utils.files.fopen(_DEB_NETWORKING_FILE) as contents:
+            for line in contents:
+                if line.startswith('#'):
+                    continue
+                elif line.startswith('CONFIGURE_INTERFACES'):
+                    opts['networking'] = line.split('=', 1)[1].strip()
 
     hostname = _parse_hostname()
     domainname = _parse_domainname()
-
-    if domainname:
-        hostname = "{0}.{1}" . format(hostname, domainname)
+    searchdomain = _parse_searchdomain()
 
     opts['hostname'] = hostname
+    opts['domainname'] = domainname
+    opts['searchdomain'] = searchdomain
     return opts
 
 
-def _parse_interfaces():
+# def __validator_func(value):
+#    return (valid: True/False, (transformed) value, error message)
+
+
+def __ipv4_quad(value):
+    '''validate an IPv4 address'''
+    return (salt.utils.validate.net.ipv4_addr(value), value,
+            'dotted IPv4 address')
+
+
+def __ipv6(value):
+    '''validate an IPv6 address'''
+    return (salt.utils.validate.net.ipv6_addr(value), value,
+            'IPv6 address')
+
+
+def __mac(value):
+    '''validate a mac address'''
+    return (salt.utils.validate.net.mac(value), value,
+            'MAC address')
+
+
+def __anything(value):
+    return (True, value, None)
+
+
+def __int(value):
+    '''validate an integer'''
+    valid, _value = False, value
+    try:
+        _value = int(value)
+        valid = True
+    except ValueError:
+        pass
+    return (valid, _value, 'integer')
+
+
+def __float(value):
+    '''validate a float'''
+    valid, _value = False, value
+    try:
+        _value = float(value)
+        valid = True
+    except ValueError:
+        pass
+    return (valid, _value, 'float')
+
+
+def __ipv4_netmask(value):
+    '''validate an IPv4 dotted quad or integer CIDR netmask'''
+    valid, errmsg = False, 'dotted quad or integer CIDR (0->32)'
+    valid, value, _ = __int(value)
+    if not (valid and 0 <= value <= 32):
+        valid = salt.utils.validate.net.netmask(value)
+    return (valid, value, errmsg)
+
+
+def __ipv6_netmask(value):
+    '''validate an IPv6 integer netmask'''
+    valid, errmsg = False, 'IPv6 netmask (0->128)'
+    valid, value, _ = __int(value)
+    valid = (valid and 0 <= value <= 128)
+    return (valid, value, errmsg)
+
+
+def __within2(value, within=None, errmsg=None, dtype=None):
+    '''validate that a value is in ``within`` and optionally a ``dtype``'''
+    valid, _value = False, value
+    if dtype:
+        try:
+            _value = dtype(value)  # TODO: this is a bit loose when dtype is a class
+            valid = _value in within
+        except ValueError:
+            pass
+    else:
+        valid = _value in within
+    if errmsg is None:
+        if dtype:
+            typename = getattr(dtype, '__name__',
+                               hasattr(dtype, '__class__')
+                               and getattr(dtype.__class__, 'name', dtype))
+            errmsg = '{0} within \'{1}\''.format(typename, within)
+        else:
+            errmsg = 'within \'{0}\''.format(within)
+    return (valid, _value, errmsg)
+
+
+def __within(within=None, errmsg=None, dtype=None):
+    return functools.partial(__within2, within=within,
+                             errmsg=errmsg, dtype=dtype)
+
+
+def __space_delimited_list(value):
+    '''validate that a value contains one or more space-delimited values'''
+    valid, _value, errmsg = False, value, 'space-delimited string'
+    try:
+        if hasattr(value, '__iter__'):
+            valid = True  # TODO:
+        else:
+            _value = value.split()
+            if _value == []:
+                raise ValueError
+            valid = True
+    except AttributeError:
+        pass
+    except ValueError:
+        pass
+    return (valid, _value, errmsg)
+
+SALT_ATTR_TO_DEBIAN_ATTR_MAP = {
+    'dns': 'dns-nameservers',
+    'search': 'dns-search',
+    'hwaddr': 'hwaddress',  # TODO: this limits bootp functionality
+    'ipaddr': 'address',
+}
+
+
+DEBIAN_ATTR_TO_SALT_ATTR_MAP = dict(
+    (v, k) for (k, v) in six.iteritems(SALT_ATTR_TO_DEBIAN_ATTR_MAP))
+
+# TODO
+DEBIAN_ATTR_TO_SALT_ATTR_MAP['address'] = 'address'
+DEBIAN_ATTR_TO_SALT_ATTR_MAP['hwaddress'] = 'hwaddress'
+
+IPV4_VALID_PROTO = ['bootp', 'dhcp', 'static', 'manual', 'loopback', 'ppp']
+
+IPV4_ATTR_MAP = {
+    'proto': __within(IPV4_VALID_PROTO, dtype=str),
+    # ipv4 static & manual
+    'address': __ipv4_quad,
+    'netmask': __ipv4_netmask,
+    'broadcast': __ipv4_quad,
+    'metric':  __int,
+    'gateway':  __ipv4_quad,  # supports a colon-delimited list
+    'pointopoint':  __ipv4_quad,
+    'hwaddress':  __mac,
+    'mtu':  __int,
+    'scope': __within(['global', 'link', 'host'], dtype=str),
+    # dhcp
+    'hostname': __anything,
+    'leasehours':  __int,
+    'leasetime':  __int,
+    'vendor': __anything,
+    'client': __anything,
+    # bootp
+    'bootfile': __anything,
+    'server':  __ipv4_quad,
+    'hwaddr':  __mac,
+    # tunnel
+    'mode':  __within(['gre', 'GRE', 'ipip', 'IPIP', '802.3ad'], dtype=str),
+    'endpoint':  __ipv4_quad,
+    'dstaddr':  __ipv4_quad,
+    'local':  __ipv4_quad,
+    'ttl':  __int,
+    # bond
+    'slaves': __anything,
+    # ppp
+    'provider': __anything,
+    'unit':  __int,
+    'options': __anything,
+    # resolvconf
+    'dns-nameservers': __space_delimited_list,
+    'dns-search': __space_delimited_list,
+    #
+    'vlan-raw-device': __anything,
+    #
+    'network': __anything,  # i don't know what this is
+
+    'test': __anything,  # TODO
+    'enable_ipv6': __anything,  # TODO
+}
+
+
+IPV6_VALID_PROTO = ['auto', 'loopback', 'static', 'manual',
+                    'dhcp', 'v4tunnel', '6to4']
+
+IPV6_ATTR_MAP = {
+    'proto': __within(IPV6_VALID_PROTO),
+    # ipv6 static & manual
+    'address': __ipv6,
+    'netmask': __ipv6_netmask,
+    'broadcast': __ipv6,
+    'gateway': __ipv6,  # supports a colon-delimited list
+    'hwaddress':  __mac,
+    'mtu':  __int,
+    'scope': __within(['global', 'site', 'link', 'host'], dtype=str),
+    # inet6 auto
+    'privext': __within([0, 1, 2], dtype=int),
+    'dhcp':  __within([0, 1], dtype=int),
+    # inet6 static & manual & dhcp
+    'media': __anything,
+    'accept_ra':  __within([0, 1], dtype=int),
+    'autoconf':  __within([0, 1], dtype=int),
+    'preferred-lifetime':  __int,
+    'dad-attempts': __int,  # 0 to disable
+    'dad-interval': __float,
+    # bond
+    'slaves': __anything,
+    # tunnel
+    'mode':  __within(['gre', 'GRE', 'ipip', 'IPIP', '802.3ad'], dtype=str),
+    'endpoint': __ipv4_quad,
+    'local':  __ipv4_quad,
+    'ttl':  __int,
+    # resolvconf
+    'dns-nameservers': __space_delimited_list,
+    'dns-search': __space_delimited_list,
+    #
+    'vlan-raw-device': __anything,
+
+    'test': __anything,  # TODO
+    'enable_ipv6': __anything,  # TODO
+}
+
+
+WIRELESS_ATTR_MAP = {
+    'wireless-essid': __anything,
+    'wireless-mode':  __anything,  # TODO
+    'wpa-ap-scan': __within([0, 1, 2], dtype=int),  # TODO
+    'wpa-conf': __anything,
+    'wpa-driver': __anything,
+    'wpa-group': __anything,
+    'wpa-key-mgmt': __anything,
+    'wpa-pairwise': __anything,
+    'wpa-psk': __anything,
+    'wpa-proto': __anything,  # partial(__within,
+    'wpa-roam': __anything,
+    'wpa-ssid': __anything,  # TODO
+}
+
+ATTRMAPS = {
+    'inet': [IPV4_ATTR_MAP, WIRELESS_ATTR_MAP],
+    'inet6': [IPV6_ATTR_MAP, WIRELESS_ATTR_MAP]
+}
+
+
+def _validate_interface_option(attr, value, addrfam='inet'):
+    '''lookup the validation function for a [addrfam][attr] and
+    return the results
+
+    :param attr: attribute name
+    :param value: raw setting value
+    :param addrfam: address family (inet, inet6,
+    '''
+    valid, _value, errmsg = False, value, 'Unknown validator'
+    attrmaps = ATTRMAPS.get(addrfam, [])
+    for attrmap in attrmaps:
+        if attr in attrmap:
+            validate_func = attrmap[attr]
+            (valid, _value, errmsg) = validate_func(value)
+            break
+    return (valid, _value, errmsg)
+
+
+def _attrmaps_contain_attr(attr):
+    return (
+        attr in WIRELESS_ATTR_MAP or
+        attr in IPV4_ATTR_MAP or
+        attr in IPV6_ATTR_MAP)
+
+
+def _parse_interfaces(interface_files=None):
     '''
     Parse /etc/network/interfaces and return current configured interfaces
     '''
-    interface_files = []
-    # Add this later.
-    #if os.path.exists("/etc/network/interfaces.d/"):
-    #    interface_files += os.listdir("/etc/network/interfaces.d/")
+    if interface_files is None:
+        interface_files = []
+        # Add this later.
+        if os.path.exists(_DEB_NETWORK_DIR):
+            interface_files += ['{0}/{1}'.format(_DEB_NETWORK_DIR, dir) for dir in os.listdir(_DEB_NETWORK_DIR)]
 
-    if os.path.isfile('/etc/network/interfaces'):
-        interface_files.insert(0, '/etc/network/interfaces')
+        if os.path.isfile(_DEB_NETWORK_FILE):
+            interface_files.insert(0, _DEB_NETWORK_FILE)
 
-    adapters = {}
-    context = -1
+    adapters = salt.utils.odict.OrderedDict()
+    method = -1
 
     for interface_file in interface_files:
-
-        interfaces = open(interface_file)
-
-        for line in interfaces:
-            # Identify the clauses by analyzing the first word of each line.
-            # Go to the next line if the current line is a comment.
-            if line.startswith('#'):
-                pass
-            else:
+        with salt.utils.files.fopen(interface_file) as interfaces:
+            # This ensures iface_dict exists, but does not ensure we're not reading a new interface.
+            iface_dict = {}
+            for line in interfaces:
+                # Identify the clauses by the first word of each line.
+                # Go to the next line if the current line is a comment
+                # or all spaces.
+                if line.lstrip().startswith('#') or line.isspace():
+                    continue
                 # Parse the iface clause
                 if line.startswith('iface'):
                     sline = line.split()
@@ -310,100 +595,105 @@ def _parse_interfaces():
                         raise AttributeError(msg)
 
                     iface_name = sline[1]
-                    context = sline[2]
+                    addrfam = sline[2]
+                    method = sline[3]
 
                     # Create item in dict, if not already there
                     if iface_name not in adapters:
-                        adapters[iface_name] = {}
+                        adapters[iface_name] = salt.utils.odict.OrderedDict()
 
                     # Create item in dict, if not already there
                     if 'data' not in adapters[iface_name]:
-                        adapters[iface_name]['data'] = {}
+                        adapters[iface_name]['data'] = salt.utils.odict.OrderedDict()
 
-                    if context not in adapters[iface_name]['data']:
-                        adapters[iface_name]['data'][context] = {}
+                    if addrfam not in adapters[iface_name]['data']:
+                        adapters[iface_name]['data'][addrfam] = salt.utils.odict.OrderedDict()
 
-                    adapters[iface_name]['data'][context]['inet_type'] = sline[2]
-                    adapters[iface_name]['data'][context]['proto'] = sline[3]
+                    iface_dict = adapters[iface_name]['data'][addrfam]
 
-                if line.isspace():
-                    pass
-                else:
-                    # Parse the detail clauses.
-                    if line[0].isspace():
-                        sline = line.split()
+                    iface_dict['addrfam'] = addrfam
+                    iface_dict['proto'] = method
+                    iface_dict['filename'] = interface_file
 
-                        if sline[0] in ['address', 'netmask', 'gateway', 'broadcast', 'network', 'mtu']:
-                            adapters[iface_name]['data'][context][sline[0]] = sline[1]
-
-                        if sline[0] == 'vlan-raw-device':
-                            adapters[iface_name]['data'][context]['vlan_raw_device'] = sline[1]
-
-                        if sline[0] in _REV_ETHTOOL_CONFIG_OPTS:
-                            ethtool_key = sline[0]
-                            if 'ethtool' not in adapters[iface_name]['data'][context]:
-                                adapters[iface_name]['data'][context]['ethtool'] = {}
-                            adapters[iface_name]['data'][context]['ethtool'][ethtool_key] = sline[1]
-
-                        if sline[0].startswith('bond'):
-                            opt = sline[0].split('_', 1)[1]
-                            sline.pop(0)
-                            value = ' '.join(sline)
-
-                            if 'bonding' not in adapters[iface_name]['data'][context]:
-                                adapters[iface_name]['data'][context]['bonding'] = {}
-                            adapters[iface_name]['data'][context]['bonding'][opt] = value
-
-                        if sline[0].startswith('bridge'):
-                            opt = sline[0].split('_', 1)[1]
-                            sline.pop(0)
-                            value = ' '.join(sline)
-
-                            if 'bridgeing' not in adapters[iface_name]['data'][context]:
-                                adapters[iface_name]['data'][context]['bridgeing'] = {}
-                            adapters[iface_name]['data'][context]['bridgeing'][opt] = value
-
-                        if sline[0].startswith('dns-nameservers'):
-                            ud = sline.pop(0)
-                            if 'dns' not in adapters[iface_name]['data'][context]:
-                                adapters[iface_name]['data'][context]['dns'] = []
-                            adapters[iface_name]['data'][context]['dns'] = sline
-
-                        if sline[0] in ['up', 'down', 'pre-up', 'post-up', 'pre-down', 'post-down']:
-                            ud = sline.pop(0)
-                            cmd = ' '.join(sline)
-                            cmd_key = '{0}_cmds'.format(re.sub('-', '_', ud))
-                            if cmd_key not in adapters[iface_name]['data'][context]:
-                                adapters[iface_name]['data'][context][cmd_key] = []
-                            adapters[iface_name]['data'][context][cmd_key].append(cmd)
-
-                if line.startswith('auto'):
+                # Parse the detail clauses.
+                elif line[0].isspace():
                     sline = line.split()
-                    for word in sline:
-                        if word == 'auto':
-                            pass
-                        else:
-                            if word not in adapters:
-                                adapters[word] = {}
-                            adapters[word]['enabled'] = True
 
-                if line.startswith('allow-hotplug'):
-                    sline = line.split()
-                    for word in sline:
-                        if word == 'allow-hotplug':
-                            pass
+                    # conf file attr: dns-nameservers
+                    # salt states.network attr: dns
+
+                    attr, valuestr = line.rstrip().split(None, 1)
+                    if _attrmaps_contain_attr(attr):
+                        if '-' in attr:
+                            attrname = attr.replace('-', '_')
                         else:
-                            if word not in adapters:
-                                adapters[word] = {}
-                            adapters[word]['hotplug'] = True
+                            attrname = attr
+                        (valid, value, errmsg) = _validate_interface_option(
+                            attr, valuestr, addrfam)
+                        iface_dict[attrname] = value
+
+                    elif attr in _REV_ETHTOOL_CONFIG_OPTS:
+                        if 'ethtool' not in iface_dict:
+                            iface_dict['ethtool'] = salt.utils.odict.OrderedDict()
+                        iface_dict['ethtool'][attr] = valuestr
+
+                    elif attr.startswith('bond'):
+                        opt = re.split(r'[_-]', attr, maxsplit=1)[1]
+                        if 'bonding' not in iface_dict:
+                            iface_dict['bonding'] = salt.utils.odict.OrderedDict()
+                        iface_dict['bonding'][opt] = valuestr
+
+                    elif attr.startswith('bridge'):
+                        opt = re.split(r'[_-]', attr, maxsplit=1)[1]
+                        if 'bridging' not in iface_dict:
+                            iface_dict['bridging'] = salt.utils.odict.OrderedDict()
+                        iface_dict['bridging'][opt] = valuestr
+
+                    elif attr in ['up', 'pre-up', 'post-up',
+                                  'down', 'pre-down', 'post-down']:
+                        cmd = valuestr
+                        cmd_key = '{0}_cmds'.format(re.sub('-', '_', attr))
+                        if cmd_key not in iface_dict:
+                            iface_dict[cmd_key] = []
+                        iface_dict[cmd_key].append(cmd)
+
+                elif line.startswith('auto'):
+                    for word in line.split()[1:]:
+                        if word not in adapters:
+                            adapters[word] = salt.utils.odict.OrderedDict()
+                        adapters[word]['enabled'] = True
+
+                elif line.startswith('allow-hotplug'):
+                    for word in line.split()[1:]:
+                        if word not in adapters:
+                            adapters[word] = salt.utils.odict.OrderedDict()
+                        adapters[word]['hotplug'] = True
+
+                elif line.startswith('source'):
+                    if 'source' not in adapters:
+                        adapters['source'] = salt.utils.odict.OrderedDict()
+
+                    # Create item in dict, if not already there
+                    if 'data' not in adapters['source']:
+                        adapters['source']['data'] = salt.utils.odict.OrderedDict()
+                        adapters['source']['data']['sources'] = []
+                    adapters['source']['data']['sources'].append(line.split()[1])
 
     # Return a sorted list of the keys for bond, bridge and ethtool options to
     # ensure a consistent order
     for iface_name in adapters:
-        for opt in ['ethtool', 'bonding', 'bridgeing']:
-            if opt in adapters[iface_name]['data']['inet']:
-                opt_keys = sorted(adapters[iface_name]['data']['inet'][opt].keys())
-                adapters[iface_name]['data']['inet'][opt + '_keys'] = opt_keys
+        if iface_name == 'source':
+            continue
+        if 'data' not in adapters[iface_name]:
+            msg = 'Interface file malformed for interface: {0}.'.format(iface_name)
+            log.error(msg)
+            adapters.pop(iface_name)
+            continue
+        for opt in ['ethtool', 'bonding', 'bridging']:
+            if 'inet' in adapters[iface_name]['data']:
+                if opt in adapters[iface_name]['data']['inet']:
+                    opt_keys = sorted(adapters[iface_name]['data']['inet'][opt].keys())
+                    adapters[iface_name]['data']['inet'][opt + '_keys'] = opt_keys
 
     return adapters
 
@@ -446,6 +736,35 @@ def _parse_ethtool_opts(opts, iface):
                 config.update({option: 'on'})
             elif opts[option] in _CONFIG_FALSE:
                 config.update({option: 'off'})
+            else:
+                _raise_error_iface(iface, option, valid)
+
+    return config
+
+
+def _parse_ethtool_pppoe_opts(opts, iface):
+    '''
+    Filters given options and outputs valid settings for ETHTOOLS_PPPOE_OPTS
+    If an option has a value that is not expected, this
+    function will log what the Interface, Setting and what it was
+    expecting.
+    '''
+    config = {}
+
+    for opt in _DEB_CONFIG_PPPOE_OPTS:
+        if opt in opts:
+            config[opt] = opts[opt]
+
+    if 'provider' in opts and not opts['provider']:
+        _raise_error_iface(iface, 'provider', _CONFIG_TRUE + _CONFIG_FALSE)
+
+    valid = _CONFIG_TRUE + _CONFIG_FALSE
+    for option in ('noipdefault', 'usepeerdns', 'defaultroute', 'hide-password', 'noauth', 'persist', 'noaccomp'):
+        if option in opts:
+            if opts[option] in _CONFIG_TRUE:
+                config.update({option: 'True'})
+            elif opts[option] in _CONFIG_FALSE:
+                config.update({option: 'False'})
             else:
                 _raise_error_iface(iface, option, valid)
 
@@ -556,9 +875,12 @@ def _parse_settings_bond_0(opts, iface, bond_def):
     if 'arp_ip_target' in opts:
         if isinstance(opts['arp_ip_target'], list):
             if 1 <= len(opts['arp_ip_target']) <= 16:
-                bond.update({'arp_ip_target': []})
+                bond.update({'arp_ip_target': ''})
                 for ip in opts['arp_ip_target']:  # pylint: disable=C0103
-                    bond['arp_ip_target'].append(ip)
+                    if len(bond['arp_ip_target']) > 0:
+                        bond['arp_ip_target'] = bond['arp_ip_target'] + ',' + ip
+                    else:
+                        bond['arp_ip_target'] = ip
             else:
                 _raise_error_iface(iface, 'arp_ip_target', valid)
         else:
@@ -600,17 +922,21 @@ def _parse_settings_bond_1(opts, iface, bond_def):
             _log_default_iface(iface, binding, bond_def[binding])
             bond.update({binding: bond_def[binding]})
 
-    if 'use_carrier' in opts:
-        if opts['use_carrier'] in _CONFIG_TRUE:
-            bond.update({'use_carrier': 'on'})
-        elif opts['use_carrier'] in _CONFIG_FALSE:
-            bond.update({'use_carrier': 'off'})
+    if 'primary' in opts:
+        bond.update({'primary': opts['primary']})
+
+    if not (__grains__['os'] == "Ubuntu" and __grains__['osrelease_info'][0] >= 16):
+        if 'use_carrier' in opts:
+            if opts['use_carrier'] in _CONFIG_TRUE:
+                bond.update({'use_carrier': '1'})
+            elif opts['use_carrier'] in _CONFIG_FALSE:
+                bond.update({'use_carrier': '0'})
+            else:
+                valid = _CONFIG_TRUE + _CONFIG_FALSE
+                _raise_error_iface(iface, 'use_carrier', valid)
         else:
-            valid = _CONFIG_TRUE + _CONFIG_FALSE
-            _raise_error_iface(iface, 'use_carrier', valid)
-    else:
-        _log_default_iface(iface, 'use_carrier', bond_def['use_carrier'])
-        bond.update({'use_carrier': bond_def['use_carrier']})
+            _log_default_iface(iface, 'use_carrier', bond_def['use_carrier'])
+            bond.update({'use_carrier': bond_def['use_carrier']})
 
     return bond
 
@@ -629,9 +955,12 @@ def _parse_settings_bond_2(opts, iface, bond_def):
     if 'arp_ip_target' in opts:
         if isinstance(opts['arp_ip_target'], list):
             if 1 <= len(opts['arp_ip_target']) <= 16:
-                bond.update({'arp_ip_target': []})
+                bond.update({'arp_ip_target': ''})
                 for ip in opts['arp_ip_target']:  # pylint: disable=C0103
-                    bond['arp_ip_target'].append(ip)
+                    if len(bond['arp_ip_target']) > 0:
+                        bond['arp_ip_target'] = bond['arp_ip_target'] + ',' + ip
+                    else:
+                        bond['arp_ip_target'] = ip
             else:
                 _raise_error_iface(iface, 'arp_ip_target', valid)
         else:
@@ -648,9 +977,6 @@ def _parse_settings_bond_2(opts, iface, bond_def):
     else:
         _log_default_iface(iface, 'arp_interval', bond_def['arp_interval'])
         bond.update({'arp_interval': bond_def['arp_interval']})
-
-    if 'primary' in opts:
-        bond.update({'primary': opts['primary']})
 
     if 'hashing-algorithm' in opts:
         valid = ['layer2', 'layer2+3', 'layer3+4']
@@ -685,9 +1011,9 @@ def _parse_settings_bond_3(opts, iface, bond_def):
 
     if 'use_carrier' in opts:
         if opts['use_carrier'] in _CONFIG_TRUE:
-            bond.update({'use_carrier': 'on'})
+            bond.update({'use_carrier': '1'})
         elif opts['use_carrier'] in _CONFIG_FALSE:
-            bond.update({'use_carrier': 'off'})
+            bond.update({'use_carrier': '0'})
         else:
             valid = _CONFIG_TRUE + _CONFIG_FALSE
             _raise_error_iface(iface, 'use_carrier', valid)
@@ -729,9 +1055,9 @@ def _parse_settings_bond_4(opts, iface, bond_def):
 
     if 'use_carrier' in opts:
         if opts['use_carrier'] in _CONFIG_TRUE:
-            bond.update({'use_carrier': 'on'})
+            bond.update({'use_carrier': '1'})
         elif opts['use_carrier'] in _CONFIG_FALSE:
-            bond.update({'use_carrier': 'off'})
+            bond.update({'use_carrier': '0'})
         else:
             valid = _CONFIG_TRUE + _CONFIG_FALSE
             _raise_error_iface(iface, 'use_carrier', valid)
@@ -772,15 +1098,18 @@ def _parse_settings_bond_5(opts, iface, bond_def):
 
     if 'use_carrier' in opts:
         if opts['use_carrier'] in _CONFIG_TRUE:
-            bond.update({'use_carrier': 'on'})
+            bond.update({'use_carrier': '1'})
         elif opts['use_carrier'] in _CONFIG_FALSE:
-            bond.update({'use_carrier': 'off'})
+            bond.update({'use_carrier': '0'})
         else:
             valid = _CONFIG_TRUE + _CONFIG_FALSE
             _raise_error_iface(iface, 'use_carrier', valid)
     else:
         _log_default_iface(iface, 'use_carrier', bond_def['use_carrier'])
         bond.update({'use_carrier': bond_def['use_carrier']})
+
+    if 'primary' in opts:
+        bond.update({'primary': opts['primary']})
 
     return bond
 
@@ -808,9 +1137,9 @@ def _parse_settings_bond_6(opts, iface, bond_def):
 
     if 'use_carrier' in opts:
         if opts['use_carrier'] in _CONFIG_TRUE:
-            bond.update({'use_carrier': 'on'})
+            bond.update({'use_carrier': '1'})
         elif opts['use_carrier'] in _CONFIG_FALSE:
-            bond.update({'use_carrier': 'off'})
+            bond.update({'use_carrier': '0'})
         else:
             valid = _CONFIG_TRUE + _CONFIG_FALSE
             _raise_error_iface(iface, 'use_carrier', valid)
@@ -818,19 +1147,23 @@ def _parse_settings_bond_6(opts, iface, bond_def):
         _log_default_iface(iface, 'use_carrier', bond_def['use_carrier'])
         bond.update({'use_carrier': bond_def['use_carrier']})
 
+    if 'primary' in opts:
+        bond.update({'primary': opts['primary']})
+
     return bond
 
 
 def _parse_bridge_opts(opts, iface):
     '''
-    Filters given options and outputs valid settings for BRIDGEING_OPTS
+    Filters given options and outputs valid settings for BRIDGING_OPTS
     If an option has a value that is not expected, this
-    function will log what the Interface, Setting and what it was
-    expecting.
+    function will log the Interface, Setting and what was expected.
     '''
     config = {}
 
     if 'ports' in opts:
+        if isinstance(opts['ports'], list):
+            opts['ports'] = ' '.join(opts['ports'])
         config.update({'ports': opts['ports']})
 
     for opt in ['ageing', 'fd', 'gcint', 'hello', 'maxage']:
@@ -850,7 +1183,7 @@ def _parse_bridge_opts(opts, iface):
 
     if 'hw' in opts:
         # match 12 hex digits with either : or - as separators between pairs
-        if re.match("[0-9a-f]{2}([-:])[0-9a-f]{2}(\\1[0-9a-f]{2}){4}$",
+        if re.match('[0-9a-f]{2}([-:])[0-9a-f]{2}(\\1[0-9a-f]{2}){4}$',
                     opts['hw'].lower()):
             config.update({'hw': opts['hw']})
         else:
@@ -896,18 +1229,45 @@ def _parse_settings_eth(opts, iface_type, enabled, iface):
     Filters given options and outputs valid settings for a
     network interface.
     '''
-    adapters = {}
-    adapters[iface] = {}
+    adapters = salt.utils.odict.OrderedDict()
+    adapters[iface] = salt.utils.odict.OrderedDict()
 
     adapters[iface]['type'] = iface_type
 
-    adapters[iface]['data'] = {}
-    adapters[iface]['data']['inet'] = {}
+    adapters[iface]['data'] = salt.utils.odict.OrderedDict()
+    iface_data = adapters[iface]['data']
+    iface_data['inet'] = salt.utils.odict.OrderedDict()
+    iface_data['inet6'] = salt.utils.odict.OrderedDict()
 
     if enabled:
         adapters[iface]['enabled'] = True
 
-    adapters[iface]['data']['inet']['inet_type'] = 'inet'
+    if opts.get('hotplug', False):
+        adapters[iface]['hotplug'] = True
+
+    # Defaults assume IPv4 (inet) interfaces unless enable_ipv6=True
+    def_addrfam = 'inet'
+    dual_stack = False
+
+    # If enable_ipv6=True, then expet either IPv6-only or dual stack.
+    if 'enable_ipv6' in opts and opts['enable_ipv6']:
+        iface_data['inet6']['addrfam'] = 'inet6'
+        iface_data['inet6']['netmask'] = '64'  # defaults to 64
+        def_addrfam = 'inet6'
+
+        if 'iface_type' in opts and opts['iface_type'] == 'vlan':
+            iface_data['inet6']['vlan_raw_device'] = (
+                re.sub(r'\.\d*', '', iface))
+
+        if 'ipaddr' in opts and 'ipv6ipaddr' in opts:
+            # If both 'ipaddr' and 'ipv6ipaddr' are present; expect dual stack
+            iface_data['inet']['addrfam'] = 'inet'
+            def_addrfam = 'inet'
+            dual_stack = True
+
+    else:
+        # If enable_ipv6=False|None, IPv6 settings should not be set.
+        iface_data['inet']['addrfam'] = 'inet'
 
     if iface_type not in ['bridge']:
         tmp_ethtool = _parse_ethtool_opts(opts, iface)
@@ -916,78 +1276,143 @@ def _parse_settings_eth(opts, iface_type, enabled, iface):
             for item in tmp_ethtool:
                 ethtool[_ETHTOOL_CONFIG_OPTS[item]] = tmp_ethtool[item]
 
-            adapters[iface]['data']['inet']['ethtool'] = ethtool
+            iface_data[def_addrfam]['ethtool'] = ethtool
             # return a list of sorted keys to ensure consistent order
-            adapters[iface]['data']['inet']['ethtool_keys'] = sorted(ethtool.keys())
-
-    if iface_type == 'bond':
-        bonding = _parse_settings_bond(opts, iface)
-        if bonding:
-            adapters[iface]['data']['inet']['bonding'] = bonding
-            adapters[iface]['data']['inet']['bonding']['slaves'] = opts['slaves']
-            adapters[iface]['data']['inet']['bonding_keys'] = sorted(bonding.keys())
-
-    if iface_type == 'slave':
-        adapters[iface]['master'] = opts['master']
-
-    if iface_type == 'vlan':
-        adapters[iface]['data']['inet']['vlan_raw_device'] = re.sub(r'\.\d*', '', iface)
+            iface_data[def_addrfam]['ethtool_keys'] = sorted(ethtool)
 
     if iface_type == 'bridge':
-        bridgeing = _parse_bridge_opts(opts, iface)
-        if bridgeing:
-            adapters[iface]['data']['inet']['bridgeing'] = bridgeing
-            adapters[iface]['data']['inet']['bridgeing_keys'] = sorted(bridgeing.keys())
+        bridging = _parse_bridge_opts(opts, iface)
+        if bridging:
+            opts.pop('mode', None)
+            iface_data[def_addrfam]['bridging'] = bridging
+            iface_data[def_addrfam]['bridging_keys'] = sorted(bridging)
+            iface_data[def_addrfam]['addrfam'] = def_addrfam
 
-    if 'proto' in opts:
-        valid = ['bootp', 'dhcp', 'none', 'static', 'manual', 'loopback']
-        if opts['proto'] in valid:
-            # no 'none' proto for Debian, set to static
-            if opts['proto'] == 'none':
-                adapters[iface]['data']['inet']['proto'] = 'static'
-            else:
-                adapters[iface]['data']['inet']['proto'] = opts['proto']
+    elif iface_type == 'bond':
+        bonding = _parse_settings_bond(opts, iface)
+        if bonding:
+            opts.pop('mode', None)
+            iface_data[def_addrfam]['bonding'] = bonding
+            iface_data[def_addrfam]['bonding']['slaves'] = opts['slaves']
+            iface_data[def_addrfam]['bonding_keys'] = sorted(bonding)
+            iface_data[def_addrfam]['addrfam'] = def_addrfam
+
+    elif iface_type == 'slave':
+        adapters[iface]['master'] = opts['master']
+
+        opts['proto'] = 'manual'
+        iface_data[def_addrfam]['master'] = adapters[iface]['master']
+        iface_data[def_addrfam]['addrfam'] = def_addrfam
+
+    elif iface_type == 'vlan':
+        iface_data[def_addrfam]['vlan_raw_device'] = re.sub(r'\.\d*', '', iface)
+        iface_data[def_addrfam]['addrfam'] = def_addrfam
+
+    elif iface_type == 'pppoe':
+        tmp_ethtool = _parse_ethtool_pppoe_opts(opts, iface)
+        if tmp_ethtool:
+            for item in tmp_ethtool:
+                adapters[iface]['data'][def_addrfam][_DEB_CONFIG_PPPOE_OPTS[item]] = tmp_ethtool[item]
+        iface_data[def_addrfam]['addrfam'] = def_addrfam
+
+    for opt in opts:
+        # trim leading "ipv6" from option
+        if opt.startswith('ipv6'):
+            optname = opt[4:]  # trim off the ipv6
+            v6only = True
         else:
-            _raise_error_iface(iface, opts['proto'], valid)
+            optname = opt
+            v6only = False
 
-    if 'ipaddr' in opts:
-        adapters[iface]['data']['inet']['address'] = opts['ipaddr']
+        _optname = SALT_ATTR_TO_DEBIAN_ATTR_MAP.get(optname, optname)
+        if _attrmaps_contain_attr(_optname):
+            valuestr = opts[opt]
 
-    for opt in ['gateway', 'mtu', 'netmask', 'network', 'broadcast']:
+            # default to 'static' if proto is 'none'
+            if optname == 'proto' and valuestr == 'none':
+                valuestr = 'static'
+
+            # If option is v6-only, don't validate against inet and always set value
+            if v6only:
+                (valid, value, errmsg) = _validate_interface_option(
+                   _optname, valuestr, addrfam='inet6')
+
+                if not valid:
+                    _raise_error_iface(iface, '\'{0}\' \'{1}\''.format(opt, valuestr), [errmsg])
+
+                # replace dashes with underscores for jinja
+                _optname = _optname.replace('-', '_')
+                iface_data['inet6'][_optname] = value
+
+            # Else, if it's a dual stack, the option may belong in both; apply v4 opt as v6 default
+            elif dual_stack:
+                valid_once = False
+                errmsg = None
+                for addrfam in ['inet', 'inet6']:
+                    (valid, value, errmsg) = _validate_interface_option(
+                       _optname, valuestr, addrfam=addrfam)
+
+                    if valid:
+                        valid_once = True
+                        # replace dashes with underscores for jinja
+                        _optname = _optname.replace('-', '_')
+                        # if a v6-only version of this option was set; don't override
+                        # otherwise, if dual stack, use the v4 version as a default value for v6
+                        # allows overriding with =None
+                        if addrfam == 'inet' or _optname not in iface_data['inet6']:
+                            iface_data[addrfam][_optname] = value
+
+                if not valid_once:
+                    _raise_error_iface(
+                        iface,
+                        '\'{0}\' \'{1}\''.format(opt, valuestr),
+                        [errmsg]
+                    )
+
+            # Else, it goes in the default(only) addrfam
+            # Not assuming v4 allows a v6 block to be created without lots of "ipv6" prefixes
+            else:
+                (valid, value, errmsg) = _validate_interface_option(
+                   _optname, valuestr, addrfam=def_addrfam)
+
+                if not valid:
+                    _raise_error_iface(
+                        iface,
+                        '\'{0}\' \'{1}\''.format(opt, valuestr),
+                        [errmsg]
+                    )
+
+                # replace dashes with underscores for jinja
+                _optname = _optname.replace('-', '_')
+                iface_data[def_addrfam][_optname] = value
+
+    for opt in ['up_cmds', 'pre_up_cmds', 'post_up_cmds',
+                'down_cmds', 'pre_down_cmds', 'post_down_cmds']:
         if opt in opts:
-            adapters[iface]['data']['inet'][opt] = opts[opt]
+            iface_data['inet'][opt] = opts[opt]
 
-    if 'dns' in opts:
-        adapters[iface]['data']['inet']['dns'] = opts['dns']
+    for addrfam in ['inet', 'inet6']:
+        if 'addrfam' in iface_data[addrfam] and iface_data[addrfam]['addrfam'] == addrfam:
+            pass
+        else:
+            iface_data.pop(addrfam)
 
-    for opt in ['up_cmds', 'pre_up_cmds', 'post_up_cmds']:
-        if opt in opts:
-            adapters[iface]['data']['inet'][opt] = opts[opt]
+    return adapters
 
-    for opt in ['down_cmds', 'pre_down_cmds', 'post_down_cmds']:
-        if opt in opts:
-            adapters[iface]['data']['inet'][opt] = opts[opt]
 
-    if 'enable_ipv6' in opts and opts['enable_ipv6']:
-        #adapters[iface]['data'].append({})
-        adapters[iface]['data']['inet6'] = {}
-        adapters[iface]['data']['inet6']['inet_type'] = 'inet6'
-        adapters[iface]['data']['inet6']['netmask'] = '64'
+def _parse_settings_source(opts, iface_type, enabled, iface):
+    '''
+    Filters given options and outputs valid settings for a
+    network interface.
+    '''
+    adapters = salt.utils.odict.OrderedDict()
+    adapters[iface] = salt.utils.odict.OrderedDict()
 
-        if 'iface_type' in opts and opts['iface_type'] == 'vlan':
-            adapters[iface]['data']['inet6']['vlan_raw_device'] = re.sub(r'\.\d*', '', iface)
+    adapters[iface]['type'] = iface_type
 
-        if 'ipv6proto' in opts:
-            adapters[iface]['data']['inet6']['proto'] = opts['ipv6proto']
-
-        if 'ipv6addr' in opts:
-            adapters[iface]['data']['inet6']['address'] = opts['ipv6addr']
-
-        if 'ipv6netmask' in opts:
-            adapters[iface]['data']['inet6']['netmask'] = opts['ipv6netmask']
-
-        if 'ipv6gateway' in opts:
-            adapters[iface]['data']['inet6']['gateway'] = opts['ipv6gateway']
+    adapters[iface]['data'] = salt.utils.odict.OrderedDict()
+    iface_data = adapters[iface]['data']
+    iface_data['sources'] = [opts['source']]
 
     return adapters
 
@@ -998,8 +1423,8 @@ def _parse_network_settings(opts, current):
     the global network settings file.
     '''
     # Normalize keys
-    opts = dict((k.lower(), v) for (k, v) in opts.iteritems())
-    current = dict((k.lower(), v) for (k, v) in current.iteritems())
+    opts = dict((k.lower(), v) for (k, v) in six.iteritems(opts))
+    current = dict((k.lower(), v) for (k, v) in six.iteritems(current))
     result = {}
 
     valid = _CONFIG_TRUE + _CONFIG_FALSE
@@ -1032,18 +1457,9 @@ def _parse_network_settings(opts, current):
     else:
         _raise_error_network('hostname', ['server1.example.com'])
 
-    #if 'nozeroconf' in opts:
-    #    if opts['nozeroconf'] in valid:
-    #        if opts['nozeroconf'] in _CONFIG_TRUE:
-    #            result['nozeroconf'] = 'true'
-    #        elif opts['nozeroconf'] in _CONFIG_FALSE:
-    #            result['nozeroconf'] = 'false'
-    #    else:
-    #        _raise_error_network('nozeroconf', valid)
+    if 'search' in opts:
+        result['search'] = opts['search']
 
-    #for opt in opts:
-    #    if opt not in ['networking', 'hostname', 'nozeroconf']:
-    #        result[opt] = opts[opt]
     return result
 
 
@@ -1053,7 +1469,7 @@ def _parse_routes(iface, opts):
     the route settings file.
     '''
     # Normalize keys
-    opts = dict((k.lower(), v) for (k, v) in opts.iteritems())
+    opts = dict((k.lower(), v) for (k, v) in six.iteritems(opts))
     result = {}
     if 'routes' not in opts:
         _raise_error_routes(iface, 'routes', 'List of routes')
@@ -1074,10 +1490,8 @@ def _write_file(iface, data, folder, pattern):
         msg = msg.format(filename, folder)
         log.error(msg)
         raise AttributeError(msg)
-    fout = salt.utils.fopen(filename, 'w')
-    fout.write(data)
-    fout.close()
-
+    with salt.utils.files.flopen(filename, 'w') as fout:
+        fout.write(data)
     return filename
 
 
@@ -1085,15 +1499,24 @@ def _write_file_routes(iface, data, folder, pattern):
     '''
     Writes a file to disk
     '''
+    # ifup / ifdown is executing given folder via run-parts.
+    # according to run-parts man-page, only filenames with this pattern are
+    # executed: (^[a-zA-Z0-9_-]+$)
+
+    # In order to make the routes file work for vlan interfaces
+    # (default would have been in example /etc/network/if-up.d/route-bond0.12)
+    # these dots in the iface name need to be replaced by underscores, so it
+    # can be executed by run-parts
+    iface = iface.replace('.', '_')
+
     filename = os.path.join(folder, pattern.format(iface))
     if not os.path.exists(folder):
         msg = '{0} cannot be written. {1} does not exist'
         msg = msg.format(filename, folder)
         log.error(msg)
         raise AttributeError(msg)
-    fout = salt.utils.fopen(filename, 'w')
-    fout.write(data)
-    fout.close()
+    with salt.utils.files.flopen(filename, 'w') as fout:
+        fout.write(data)
 
     __salt__['file.set_mode'](filename, '0755')
     return filename
@@ -1111,17 +1534,15 @@ def _write_file_network(data, filename, create=False):
         msg = msg.format(filename)
         log.error(msg)
         raise AttributeError(msg)
-    fout = salt.utils.fopen(filename, 'w')
-    fout.write(data)
-
-    fout.close()
+    with salt.utils.files.flopen(filename, 'w') as fout:
+        fout.write(data)
 
 
 def _read_temp(data):
     '''
     Return what would be written to disk
     '''
-    tout = StringIO.StringIO()
+    tout = StringIO()
     tout.write(data)
     tout.seek(0)
     output = tout.readlines()
@@ -1145,44 +1566,88 @@ def _read_temp_ifaces(iface, data):
     return [item + '\n' for item in ifcfg.split('\n')]
 
 
-def _write_file_ifaces(iface, data):
+def _write_file_ifaces(iface, data, **settings):
     '''
     Writes a file to disk
     '''
     try:
-        template = JINJA.get_template('debian_eth.jinja')
+        eth_template = JINJA.get_template('debian_eth.jinja')
+        source_template = JINJA.get_template('debian_source.jinja')
     except jinja2.exceptions.TemplateNotFound:
         log.error('Could not load template debian_eth.jinja')
+        return ''
+
+    # Read /etc/network/interfaces into a dict
+    adapters = _parse_interfaces()
+    # Apply supplied settings over on-disk settings
+    adapters[iface] = data
+
+    ifcfg = ''
+    for adapter in adapters:
+        if 'type' in adapters[adapter] and adapters[adapter]['type'] == 'source':
+            tmp = source_template.render({'name': adapter, 'data': adapters[adapter]})
+        else:
+            tmp = eth_template.render({'name': adapter, 'data': adapters[adapter]})
+        ifcfg = ifcfg + tmp
+        if adapter == iface:
+            saved_ifcfg = tmp
+
+    _SEPARATE_FILE = False
+    if 'filename' in settings:
+        if not settings['filename'].startswith('/'):
+            filename = '{0}/{1}'.format(_DEB_NETWORK_DIR, settings['filename'])
+        else:
+            filename = settings['filename']
+        _SEPARATE_FILE = True
+    else:
+        if 'filename' in adapters[adapter]['data']:
+            filename = adapters[adapter]['data']
+        else:
+            filename = _DEB_NETWORK_FILE
+
+    if not os.path.exists(os.path.dirname(filename)):
+        msg = '{0} cannot be written.'
+        msg = msg.format(os.path.dirname(filename))
+        log.error(msg)
+        raise AttributeError(msg)
+    with salt.utils.files.flopen(filename, 'w') as fout:
+        if _SEPARATE_FILE:
+            fout.write(saved_ifcfg)
+        else:
+            fout.write(ifcfg)
+
+    # Return as a array so the difflib works
+    return saved_ifcfg.split('\n')
+
+
+def _write_file_ppp_ifaces(iface, data):
+    '''
+    Writes a file to disk
+    '''
+    try:
+        template = JINJA.get_template('debian_ppp_eth.jinja')
+    except jinja2.exceptions.TemplateNotFound:
+        log.error('Could not load template debian_ppp_eth.jinja')
         return ''
 
     adapters = _parse_interfaces()
     adapters[iface] = data
 
     ifcfg = ''
-    for adapter in adapters:
-        if 'type' in adapters[adapter] and adapters[adapter]['type'] == 'slave':
-            # Override values so the interfaces file is correct
-            adapters[adapter]['enabled'] = False
-            adapters[adapter]['data']['inet']['inet_type'] = 'inet'
-            adapters[adapter]['data']['inet']['proto'] = 'manual'
+    tmp = template.render({'data': adapters[iface]})
+    ifcfg = tmp + ifcfg
 
-        tmp = template.render({'name': adapter, 'data': adapters[adapter]})
-        ifcfg = tmp + ifcfg
-        if adapter == iface:
-            saved_ifcfg = tmp
-
-    filename = _DEB_NETWORK_FILE
+    filename = _DEB_PPP_DIR + '/' + adapters[iface]['data']['inet']['provider']
     if not os.path.exists(os.path.dirname(filename)):
         msg = '{0} cannot be written.'
         msg = msg.format(os.path.dirname(filename))
         log.error(msg)
         raise AttributeError(msg)
-    fout = salt.utils.fopen(filename, 'w')
-    fout.write(ifcfg)
-    fout.close()
+    with salt.utils.files.fopen(filename, 'w') as fout:
+        fout.write(ifcfg)
 
     # Return as a array so the difflib works
-    return saved_ifcfg.split('\n')
+    return filename
 
 
 def build_bond(iface, **settings):
@@ -1206,19 +1671,17 @@ def build_bond(iface, **settings):
         return ''
     data = template.render({'name': iface, 'bonding': opts})
 
-    if settings['test']:
+    if 'test' in settings and settings['test']:
         return _read_temp(data)
 
     _write_file(iface, data, _DEB_NETWORK_CONF_FILES, '{0}.conf'.format(iface))
     path = os.path.join(_DEB_NETWORK_CONF_FILES, '{0}.conf'.format(iface))
     if deb_major == '5':
-        __salt__['cmd.run'](
-            'sed -i -e "/^alias\\s{0}.*/d" /etc/modprobe.conf'.format(iface)
-        )
-        __salt__['cmd.run'](
-            'sed -i -e "/^options\\s{0}.*/d" /etc/modprobe.conf'.format(iface)
-        )
-        __salt__['cmd.run']('cat {0} >> /etc/modprobe.conf'.format(path))
+        for line_type in ('alias', 'options'):
+            cmd = ['sed', '-i', '-e', r'/^{0}\s{1}.*/d'.format(line_type, iface),
+                   '/etc/modprobe.conf']
+            __salt__['cmd.run'](cmd, python_shell=False)
+        __salt__['file.append']('/etc/modprobe.conf', path)
 
     # Load kernel module
     __salt__['kmod.load']('bonding')
@@ -1246,6 +1709,9 @@ def build_interface(iface, iface_type, enabled, **settings):
     if iface_type not in _IFACE_TYPES:
         _raise_error_iface(iface, iface_type, _IFACE_TYPES)
 
+    if 'proto' not in settings:
+        settings['proto'] = 'static'
+
     if iface_type == 'slave':
         settings['slave'] = 'yes'
         if 'master' not in settings:
@@ -1253,29 +1719,44 @@ def build_interface(iface, iface_type, enabled, **settings):
             log.error(msg)
             raise AttributeError(msg)
 
-    if iface_type == 'vlan':
+    elif iface_type == 'vlan':
         settings['vlan'] = 'yes'
+        __salt__['pkg.install']('vlan')
 
-    if iface_type is 'bond':
+    elif iface_type == 'pppoe':
+        settings['pppoe'] = 'yes'
+        if not __salt__['pkg.version']('ppp'):
+            inst = __salt__['pkg.install']('ppp')
+
+    elif iface_type == 'bond':
         if 'slaves' not in settings:
             msg = 'slaves is a required setting for bond interfaces'
             log.error(msg)
             raise AttributeError(msg)
 
-    if iface_type == 'bridge':
+    elif iface_type == 'bridge':
         if 'ports' not in settings:
-            msg = 'ports is a required setting for bridge interfaces'
+            msg = (
+                'ports is a required setting for bridge interfaces on Debian '
+                'or Ubuntu based systems'
+            )
             log.error(msg)
             raise AttributeError(msg)
         __salt__['pkg.install']('bridge-utils')
 
-    if iface_type in ['eth', 'bond', 'bridge', 'slave', 'vlan']:
+    if iface_type in ['eth', 'bond', 'bridge', 'slave', 'vlan', 'pppoe']:
         opts = _parse_settings_eth(settings, iface_type, enabled, iface)
+
+    if iface_type in ['source']:
+        opts = _parse_settings_source(settings, iface_type, enabled, iface)
 
     if 'test' in settings and settings['test']:
         return _read_temp_ifaces(iface, opts[iface])
 
-    ifcfg = _write_file_ifaces(iface, opts[iface])
+    ifcfg = _write_file_ifaces(iface, opts[iface], **settings)
+
+    if iface_type == 'pppoe':
+        _write_file_ppp_ifaces(iface, opts[iface])
 
     # ensure lines in list end with newline, so difflib works
     return [item + '\n' for item in ifcfg]
@@ -1300,17 +1781,27 @@ def build_routes(iface, **settings):
         log.error('Could not load template route_eth.jinja')
         return ''
 
-    add_routecfg = template.render(route_type='add', routes=opts['routes'], iface=iface)
+    add_routecfg = template.render(route_type='add',
+                                   routes=opts['routes'],
+                                   iface=iface)
 
-    del_routecfg = template.render(route_type='del', routes=opts['routes'], iface=iface)
+    del_routecfg = template.render(route_type='del',
+                                   routes=opts['routes'],
+                                   iface=iface)
 
     if 'test' in settings and settings['test']:
         return _read_temp(add_routecfg + del_routecfg)
 
-    filename = _write_file_routes(iface, add_routecfg, _DEB_NETWORK_UP_DIR, 'route-{0}')
+    filename = _write_file_routes(iface,
+                                  add_routecfg,
+                                  _DEB_NETWORK_UP_DIR,
+                                  'route-{0}')
     results = _read_file(filename)
 
-    filename = _write_file_routes(iface, del_routecfg, _DEB_NETWORK_DOWN_DIR, 'route-{0}')
+    filename = _write_file_routes(iface,
+                                  del_routecfg,
+                                  _DEB_NETWORK_DOWN_DIR,
+                                  'route-{0}')
     results += _read_file(filename)
 
     return results
@@ -1324,11 +1815,12 @@ def down(iface, iface_type):
 
     .. code-block:: bash
 
-        salt '*' ip.down eth0
+        salt '*' ip.down eth0 eth
     '''
     # Slave devices are controlled by the master.
-    if iface_type not in ['slave']:
-        return __salt__['cmd.run']('ifdown {0}'.format(iface))
+    # Source 'interfaces' aren't brought down.
+    if iface_type not in ['slave', 'source']:
+        return __salt__['cmd.run'](['ifdown', iface])
     return None
 
 
@@ -1360,7 +1852,10 @@ def get_interface(iface):
     adapters = _parse_interfaces()
     if iface in adapters:
         try:
-            template = JINJA.get_template('debian_eth.jinja')
+            if iface == 'source':
+                template = JINJA.get_template('debian_source.jinja')
+            else:
+                template = JINJA.get_template('debian_eth.jinja')
         except jinja2.exceptions.TemplateNotFound:
             log.error('Could not load template debian_eth.jinja')
             return ''
@@ -1381,11 +1876,12 @@ def up(iface, iface_type):  # pylint: disable=C0103
 
     .. code-block:: bash
 
-        salt '*' ip.up eth0
+        salt '*' ip.up eth0 eth
     '''
     # Slave devices are controlled by the master.
-    if iface_type not in ['slave']:
-        return __salt__['cmd.run']('ifup {0}'.format(iface))
+    # Source 'interfaces' aren't brought up.
+    if iface_type not in ('slave', 'source'):
+        return __salt__['cmd.run'](['ifup', iface])
     return None
 
 
@@ -1399,13 +1895,33 @@ def get_network_settings():
 
         salt '*' ip.get_network_settings
     '''
+    skip_etc_default_networking = (
+        __grains__['osfullname'] == 'Ubuntu' and
+        int(__grains__['osrelease'].split('.')[0]) >= 12)
 
-    settings = _parse_current_network_settings()
+    if skip_etc_default_networking:
+        settings = {}
+        if __salt__['service.available']('networking'):
+            if __salt__['service.status']('networking'):
+                settings['networking'] = "yes"
+            else:
+                settings['networking'] = "no"
+        else:
+            settings['networking'] = "no"
+
+        hostname = _parse_hostname()
+        domainname = _parse_domainname()
+
+        settings['hostname'] = hostname
+        settings['domainname'] = domainname
+
+    else:
+        settings = _parse_current_network_settings()
 
     try:
-        template = JINJA.get_template('network.jinja')
+        template = JINJA.get_template('display-network.jinja')
     except jinja2.exceptions.TemplateNotFound:
-        log.error('Could not load template network.jinja')
+        log.error('Could not load template display-network.jinja')
         return ''
 
     network = template.render(settings)
@@ -1420,7 +1936,7 @@ def get_routes(iface):
 
     .. code-block:: bash
 
-        salt '*' ip.get_interface eth0
+        salt '*' ip.get_routes eth0
     '''
 
     filename = os.path.join(_DEB_NETWORK_UP_DIR, 'route-{0}'.format(iface))
@@ -1445,16 +1961,33 @@ def apply_network_settings(**settings):
     if 'require_reboot' not in settings:
         settings['require_reboot'] = False
 
+    if 'apply_hostname' not in settings:
+        settings['apply_hostname'] = False
+
+    hostname_res = True
+    if settings['apply_hostname'] in _CONFIG_TRUE:
+        if 'hostname' in settings:
+            hostname_res = __salt__['network.mod_hostname'](settings['hostname'])
+        else:
+            log.warning(
+                'The network state sls is trying to apply hostname '
+                'changes but no hostname is defined.'
+            )
+            hostname_res = False
+
+    res = True
     if settings['require_reboot'] in _CONFIG_TRUE:
         log.warning(
             'The network state sls is requiring a reboot of the system to '
             'properly apply network configuration.'
         )
-        return True
+        res = True
     else:
         stop = __salt__['service.stop']('networking')
         time.sleep(2)
-        return stop and __salt__['service.start']('networking')
+        res = stop and __salt__['service.start']('networking')
+
+    return hostname_res and res
 
 
 def build_network_settings(**settings):
@@ -1467,79 +2000,132 @@ def build_network_settings(**settings):
 
         salt '*' ip.build_network_settings <settings>
     '''
+    changes = []
+
     # Read current configuration and store default values
     current_network_settings = _parse_current_network_settings()
 
     # Build settings
     opts = _parse_network_settings(settings, current_network_settings)
-    try:
-        template = JINJA.get_template('network.jinja')
-    except jinja2.exceptions.TemplateNotFound:
-        log.error('Could not load template network.jinja')
-        return ''
-    network = template.render(opts)
-
-    if settings['test']:
-        return _read_temp(network)
 
     # Ubuntu has moved away from /etc/default/networking
     # beginning with the 12.04 release so we disable or enable
     # the networking related services on boot
-    if __grains__['osfullname'] == 'Ubuntu':
-        osmajor = __grains__['osrelease'].split('.')[0]
-        if int(osmajor) >= 12:
-            if opts['networking'] == 'yes':
-                service_cmd = 'service.enable'
-            else:
-                service_cmd = 'service.disable'
-
-            if __salt__['service.available']("NetworkManager"):
-                __salt__[service_cmd]("NetworkManager")
-
-            if __salt__['service.available']("networking"):
-                __salt__[service_cmd]("networking")
+    skip_etc_default_networking = (
+        __grains__['osfullname'] == 'Ubuntu' and
+        int(__grains__['osrelease'].split('.')[0]) >= 12)
+    if skip_etc_default_networking:
+        if opts['networking'] == 'yes':
+            service_cmd = 'service.enable'
         else:
-            # Write settings
-            _write_file_network(network, _DEB_NETWORKING_FILE, True)
+            service_cmd = 'service.disable'
+
+        if __salt__['service.available']('NetworkManager'):
+            __salt__[service_cmd]('NetworkManager')
+
+        if __salt__['service.available']('networking'):
+            __salt__[service_cmd]('networking')
     else:
+        try:
+            template = JINJA.get_template('network.jinja')
+        except jinja2.exceptions.TemplateNotFound:
+            log.error('Could not load template network.jinja')
+            return ''
+        network = template.render(opts)
+
+        if 'test' in settings and settings['test']:
+            return _read_temp(network)
         # Write settings
         _write_file_network(network, _DEB_NETWORKING_FILE, True)
 
     # Write hostname to /etc/hostname
     sline = opts['hostname'].split('.', 1)
-    hostname = "{0}\n" . format(sline[0])
-    _write_file_network(hostname, _DEB_HOSTNAME_FILE)
+    opts['hostname'] = sline[0]
+    hostname = '{0}\n' . format(opts['hostname'])
+    current_domainname = current_network_settings['domainname']
+    current_searchdomain = current_network_settings['searchdomain']
 
-    # Write domainname to /etc/resolv.conf
-    if len(sline) > 0:
-        domainname = sline[1]
+    # Only write the hostname if it has changed
+    if not opts['hostname'] == current_network_settings['hostname']:
+        if not ('test' in settings and settings['test']):
+            # TODO  replace wiht a call to network.mod_hostname instead
+            _write_file_network(hostname, _DEB_HOSTNAME_FILE)
 
+    new_domain = False
+    if len(sline) > 1:
+        new_domainname = sline[1]
+        if new_domainname != current_domainname:
+            domainname = new_domainname
+            opts['domainname'] = new_domainname
+            new_domain = True
+        else:
+            domainname = current_domainname
+            opts['domainname'] = domainname
+    else:
+        domainname = current_domainname
+        opts['domainname'] = domainname
+
+    new_search = False
+    if 'search' in opts:
+        new_searchdomain = opts['search']
+        if new_searchdomain != current_searchdomain:
+            searchdomain = new_searchdomain
+            opts['searchdomain'] = new_searchdomain
+            new_search = True
+        else:
+            searchdomain = current_searchdomain
+            opts['searchdomain'] = searchdomain
+    else:
+        searchdomain = current_searchdomain
+        opts['searchdomain'] = searchdomain
+
+    # If the domain changes, then we should write the resolv.conf file.
+    if new_domain or new_search:
+        # Look for existing domain line and update if necessary
         contents = _parse_resolve()
-        pattern = r"domain\s+(?P<domain_name>\S+)"
-        prog = re.compile(pattern)
+        domain_prog = re.compile(r'domain\s+(?P<domain_name>\S+)')
+        search_prog = re.compile(r'search\s+(?P<search_domain>\S+)')
         new_contents = []
         found_domain = False
+        found_search = False
         for item in contents:
-            match = prog.match(item)
-            if match:
-                new_contents.append("domain {0}\n" . format(domainname))
+            domain_match = domain_prog.match(item)
+            search_match = search_prog.match(item)
+            if domain_match:
+                new_contents.append('domain {0}\n' . format(domainname))
                 found_domain = True
+            elif search_match:
+                new_contents.append('search {0}\n' . format(searchdomain))
+                found_search = True
             else:
                 new_contents.append(item)
 
-        # Not found add to beginning
+        # A domain line didn't exist so we'll add one in
+        # with the new domainname
         if not found_domain:
-            new_contents.insert(0, "domain {0}\n" . format(domainname))
+            new_contents.insert(0, 'domain {0}\n' . format(domainname))
 
-        new_resolv = "".join(new_contents)
+        # A search line didn't exist so we'll add one in
+        # with the new search domain
+        if not found_search:
+            if new_contents[0].startswith('domain'):
+                new_contents.insert(1, 'search {0}\n' . format(searchdomain))
+            else:
+                new_contents.insert(0, 'search {0}\n' . format(searchdomain))
 
-        _write_file_network(new_resolv, _DEB_RESOLV_FILE)
+        new_resolv = ''.join(new_contents)
 
+        # Write /etc/resolv.conf
+        if not ('test' in settings and settings['test']):
+            _write_file_network(new_resolv, _DEB_RESOLV_FILE)
+
+    #  used for returning the results back
     try:
-        template = JINJA.get_template('network.jinja')
+        template = JINJA.get_template('display-network.jinja')
     except jinja2.exceptions.TemplateNotFound:
-        log.error('Could not load template network.jinja')
+        log.error('Could not load template display-network.jinja')
         return ''
-
     network = template.render(opts)
-    return _read_temp(network)
+    changes.extend(_read_temp(network))
+
+    return changes

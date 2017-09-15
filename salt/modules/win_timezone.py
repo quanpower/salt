@@ -2,11 +2,15 @@
 '''
 Module for managing timezone on Windows systems.
 '''
+from __future__ import absolute_import
 
-# Import python libs
-import salt.utils
+# Import Python libs
 import logging
 import re
+
+# Import Salt libs
+import salt.utils.path
+import salt.utils.platform
 
 log = logging.getLogger(__name__)
 
@@ -250,6 +254,7 @@ LINTOWIN = {
     'Asia/Jerusalem': 'Israel Standard Time',
     'Asia/Kabul': 'Afghanistan Standard Time',
     'Asia/Karachi': 'Pakistan Standard Time',
+    'Asia/Kathmandu': 'Nepal Standard Time',
     'Asia/Katmandu': 'Nepal Standard Time',
     'Asia/Krasnoyarsk': 'North Asia Standard Time',
     'Asia/Kuala_Lumpur': 'Singapore Standard Time',
@@ -456,9 +461,9 @@ def __virtual__():
     '''
     Only load on windows
     '''
-    if salt.utils.is_windows():
+    if salt.utils.platform.is_windows() and salt.utils.path.which('tzutil'):
         return __virtualname__
-    return False
+    return (False, "Module win_timezone: tzutil not found or is not on Windows client")
 
 
 def get_zone():
@@ -471,7 +476,7 @@ def get_zone():
 
         salt '*' timezone.get_zone
     '''
-    winzone = __salt__['cmd.run']('tzutil /g')
+    winzone = __salt__['cmd.run'](['tzutil', '/g'], python_shell=False)
     for key in LINTOWIN:
         if LINTOWIN[key] == winzone:
             return key
@@ -490,9 +495,12 @@ def get_offset():
         salt '*' timezone.get_offset
     '''
     string = False
-    zone = __salt__['cmd.run']('tzutil /g')
+    zone = __salt__['cmd.run'](['tzutil', '/g'], python_shell=False)
     prev = ''
-    for line in __salt__['cmd.run']('tzutil /l').splitlines():
+    zone_list = __salt__['cmd.run'](['tzutil', '/l'],
+                                    python_shell=False,
+                                    output_loglevel='trace').splitlines()
+    for line in zone_list:
         if zone == line:
             string = prev
             break
@@ -539,7 +547,8 @@ def set_zone(timezone):
 
         salt '*' timezone.set_zone 'America/Denver'
     '''
-    return __salt__['cmd.retcode']('tzutil /s "{0}"'.format(LINTOWIN[timezone])) == 0
+    cmd = ['tzutil', '/s', LINTOWIN[timezone]]
+    return __salt__['cmd.retcode'](cmd, python_shell=False) == 0
 
 
 def zone_compare(timezone):
@@ -554,7 +563,8 @@ def zone_compare(timezone):
 
         salt '*' timezone.zone_compare 'America/Denver'
     '''
-    return __salt__['cmd.run']('tzutil /g') == LINTOWIN[timezone]
+    cmd = ['tzutil', '/g']
+    return __salt__['cmd.run'](cmd, python_shell=False) == LINTOWIN[timezone]
 
 
 def get_hwclock():

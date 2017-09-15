@@ -2,6 +2,7 @@
 '''
 Support for Debconf
 '''
+from __future__ import absolute_import
 
 # Import python libs
 import logging
@@ -10,6 +11,9 @@ import re
 
 # Import salt libs
 import salt.utils
+import salt.utils.path
+import salt.utils.files
+import salt.utils.versions
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +31,12 @@ def __virtual__():
     is installed.
     '''
     if __grains__['os_family'] != 'Debian':
-        return False
+        return (False, 'The debconfmod module could not be loaded: '
+                'unsupported OS family')
 
-    if salt.utils.which('debconf-get-selections') is None:
-        return False
+    if salt.utils.path.which('debconf-get-selections') is None:
+        return (False, 'The debconfmod module could not be loaded: '
+                'debconf-utils is not installed.')
 
     return __virtualname__
 
@@ -103,7 +109,7 @@ def _set_file(path):
     '''
     cmd = 'debconf-set-selections {0}'.format(path)
 
-    __salt__['cmd.run_stdout'](cmd)
+    __salt__['cmd.run_stdout'](cmd, python_shell=False)
 
 
 def set_(package, question, type, value, *extra):
@@ -120,7 +126,7 @@ def set_(package, question, type, value, *extra):
     if extra:
         value = ' '.join((value,) + tuple(extra))
 
-    fd_, fname = salt.utils.mkstemp(prefix="salt-", close_fd=False)
+    fd_, fname = salt.utils.files.mkstemp(prefix="salt-", close_fd=False)
 
     line = "{0} {1} {2} {3}".format(package, question, type, value)
     os.write(fd_, line)
@@ -131,6 +137,42 @@ def set_(package, question, type, value, *extra):
     os.unlink(fname)
 
     return True
+
+
+def set_template(path, template, context, defaults, saltenv='base', **kwargs):
+    '''
+    Set answers to debconf questions from a template.
+
+    path
+        location of the file containing the package selections
+
+    template
+        template format
+
+    context
+        variables to add to the template environment
+
+    default
+        default values for the template environment
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' debconf.set_template salt://pathto/pkg.selections.jinja jinja None None
+
+    '''
+
+    path = __salt__['cp.get_template'](
+        path=path,
+        dest=None,
+        template=template,
+        saltenv=saltenv,
+        context=context,
+        defaults=defaults,
+        **kwargs)
+
+    return set_file(path, saltenv, **kwargs)
 
 
 def set_file(path, saltenv='base', **kwargs):
@@ -144,13 +186,9 @@ def set_file(path, saltenv='base', **kwargs):
         salt '*' debconf.set_file salt://pathto/pkg.selections
     '''
     if '__env__' in kwargs:
-        salt.utils.warn_until(
-            'Boron',
-            'Passing a salt environment should be done using \'saltenv\' not '
-            '\'__env__\'. This functionality will be removed in Salt Boron.'
-        )
-        # Backwards compatibility
-        saltenv = kwargs['__env__']
+        # "env" is not supported; Use "saltenv".
+        kwargs.pop('__env__')
+
     path = __salt__['cp.cache_file'](path, saltenv)
     if path:
         _set_file(path)

@@ -5,12 +5,15 @@ Configuration disposable regularly scheduled tasks for at.
 
 The at state can be add disposable regularly scheduled tasks for your system.
 '''
+from __future__ import absolute_import
+
+# Import Python libs
+import logging
 
 # Import salt libs
-import salt.utils
+from salt.ext.six.moves import map
 
-# Tested on OpenBSD 5.0
-BSD = ('OpenBSD', 'FreeBSD')
+log = logging.getLogger(__name__)
 
 
 def __virtual__():
@@ -20,195 +23,288 @@ def __virtual__():
     return 'at.at' in __salt__
 
 
-def present(name, timespec, tag=None, runas=None, user=None, job=None):
+def present(name, timespec, tag=None, user=None, job=None, unique_tag=False):
     '''
+    .. versionchanged:: 2017.7.0
     Add a job to queue.
 
-    job
+    job : string
         Command to run.
 
-    timespec
+    timespec : string
         The 'timespec' follows the format documented in the at(1) manpage.
 
-    tag
+    tag : string
         Make a tag for the job.
 
-    runas
-        Users run the job.
-
-        .. deprecated:: 2014.1.4 (Hydrogen)
-
-    user
+    user : string
         The user to run the at job
+        .. versionadded:: 2014.1.4
 
-        .. versionadded:: 2014.1.4 (Hydrogen)
+    unique_tag : boolean
+        If set to True job will not be added if a job with the tag exists.
+        .. versionadded:: 2017.7.0
 
     .. code-block:: yaml
 
         rose:
           at.present:
             - job: 'echo "I love saltstack" > love'
-            - timespec: '9:9 11/09/13'
+            - timespec: '9:09 11/09/13'
             - tag: love
             - user: jam
 
     '''
-    if job:
-        name = job
     ret = {'name': name,
            'changes': {},
            'result': True,
-           'comment': 'job {0} is add and will run on {1}'.format(name,
-                                                                  timespec)}
+           'comment': ''}
 
-    salt.utils.warn_until(
-        'Lithium',
-        'Please remove \'runas\' support at this stage. \'user\' support was '
-        'added in 2014.1.4 (Hydrogen). Support will be removed in {version}.',
-        _dont_call_warnings=True
-    )
-    if runas:
-        # Warn users about the deprecation
-        ret.setdefault('warnings', []).append(
-            'The \'runas\' argument is being deprecated in favor of \'user\', '
-            'please update your state files.'
-        )
-    if user is not None and runas is not None:
-        # user wins over runas but let warn about the deprecation.
-        ret.setdefault('warnings', []).append(
-            'Passed both the \'runas\' and \'user\' arguments. Please don\'t. '
-            '\'runas\' is being ignored in favor of \'user\'.'
-        )
-        runas = None
-    elif runas is not None:
-        # Support old runas usage
-        user = runas
-        runas = None
+    # if job is missing, use name
+    if not job:
+        job = name
 
-    binary = salt.utils.which('at')
-
+    # quick return on test=True
     if __opts__['test']:
         ret['result'] = None
-        ret['comment'] = 'job {0} is add and will run on {1}'.format(name,
-                                                                     timespec)
+        ret['comment'] = 'job {0} added and will run on {1}'.format(
+            job,
+            timespec,
+        )
         return ret
 
-    if __grains__['os_family'] == 'RedHat':
-        echo_cmd = 'echo -e'
-    else:
-        echo_cmd = 'echo'
-
-    if tag:
-        cmd = '{0} "### SALT: {4}\n{1}" | {2} {3}'.format(echo_cmd,
-            job, binary, timespec, tag)
-    else:
-        cmd = '{0} "{1}" | {2} {3}'.format(echo_cmd, name, binary, timespec)
-
-    if runas:
-        luser = __salt__['user.info'](runas)
-        if not luser:
-            ret['comment'] = 'User: {0} is not exists'.format(runas)
+    # quick return if unique_tag and job exists
+    if unique_tag:
+        if not tag:
             ret['result'] = False
+            ret['comment'] = 'no tag provided and unique_tag is set to True'
             return ret
-        ret['comment'] = __salt__['cmd.run']('{0}'.format(cmd), runas=runas)
+        elif len(__salt__['at.jobcheck'](tag=tag)['jobs']) > 0:
+            ret['comment'] = 'atleast one job with tag {tag} exists.'.format(
+                tag=tag
+            )
+            return ret
+
+    # create job
+    if user:
+        luser = __salt__['user.info'](user)
+        if not luser:
+            ret['result'] = False
+            ret['comment'] = 'user {0} does not exists'.format(user)
+            return ret
+        ret['comment'] = 'job {0} added and will run as {1} on {2}'.format(
+            job,
+            user,
+            timespec,
+        )
+        res = __salt__['at.at'](
+            timespec,
+            job,
+            tag=tag,
+            runas=user,
+        )
     else:
-        ret['comment'] = __salt__['cmd.run']('{0}'.format(cmd))
+        ret['comment'] = 'job {0} added and will run on {1}'.format(
+            job,
+            timespec,
+        )
+        res = __salt__['at.at'](
+            timespec,
+            job,
+            tag=tag,
+        )
+
+    # set ret['changes']
+    if 'jobs' in res and len(res['jobs']) > 0:
+        ret['changes'] = res['jobs'][0]
+    if 'error' in res:
+        ret['result'] = False
+        ret['comment'] = res['error']
 
     return ret
 
 
 def absent(name, jobid=None, **kwargs):
     '''
+    .. versionchanged:: 2017.7.0
     Remove a job from queue
-    The 'kwargs' can include hour. minute. day. month. year
 
-    limit
-        Target range
+    jobid: string|int
+        Specific jobid to remove
 
-    tag
+    tag : string
         Job's tag
 
-    runas
+    runas : string
         Runs user-specified jobs
+
+    **kwags : *
+        Addition kwargs can be provided to filter jobs.
+        See output of `at.jobcheck` for more.
 
     .. code-block:: yaml
 
         example1:
           at.absent:
-            - limit: all
+
+    .. warning::
+        this will remove all jobs!
 
     .. code-block:: yaml
 
         example2:
           at.absent:
-            - limit: all
             - year: 13
 
     .. code-block:: yaml
 
         example3:
           at.absent:
-            - limit: all
             - tag: rose
-            - runas: jim
 
     .. code-block:: yaml
 
         example4:
           at.absent:
-            - limit: all
             - tag: rose
             - day: 13
             - hour: 16
+
+    .. code-block:: yaml
+
+        example5:
+          at.absent:
+            - jobid: 4
+
+    .. note:
+        all other filters are ignored and only job with id 4 is removed
     '''
-    if 'limit' in kwargs:
-        name = kwargs['limit']
     ret = {'name': name,
            'changes': {},
            'result': True,
            'comment': ''}
 
-    binary = salt.utils.which('at')
-
-    if __opts__['test']:
-        ret['result'] = None
-        ret['comment'] = 'Remove jobs()'
-        return ret
-
-    if name != 'all':
+    # limit was never support
+    if 'limit' in kwargs:
         ret['comment'] = 'limit parameter not supported {0}'.format(name)
         ret['result'] = False
         return ret
 
-    #if jobid:
-    #    output = __salt__['cmd.run']('{0} -d {1}'.format(binary, jobid))
-    #    if i in map(str, [j['job'] for j in __salt__['at.atq']()['jobs']]):
-    #        ret['result'] = False
-    #        return ret
-    #    ret['comment'] = 'Remove job({0}) from queue'.format(' '.join(opts))
-    #    return ret
-
-    if kwargs:
-        opts = map(str, [j['job'] for j in __salt__['at.jobcheck'](**kwargs)['jobs']])
-    else:
-        opts = map(str, [j['job'] for j in __salt__['at.atq']()['jobs']])
-
-    if not opts:
-        ret['result'] = False
-        ret['comment'] = 'No match jobs or time format error'
+    # quick return on test=True
+    if __opts__['test']:
+        ret['result'] = None
+        ret['comment'] = 'removed ? job(s)'
         return ret
 
-    __salt__['cmd.run']('{0} -d {1}'.format(binary, ' '.join(opts)))
-    fail = []
-    for i in opts:
-        if i in map(str, [j['job'] for j in __salt__['at.atq']()['jobs']]):
-            fail.append(i)
+    # remove specific job
+    if jobid:
+        jobs = __salt__['at.atq'](jobid)
+        if 'jobs' in jobs and len(jobs['jobs']) == 0:
+            ret['result'] = True
+            ret['comment'] = 'job with id {jobid} not present'.format(
+                jobid=jobid
+            )
+            return ret
+        elif 'jobs' in jobs and len(jobs['jobs']) == 1:
+            if 'job' in jobs['jobs'][0] and jobs['jobs'][0]['job']:
+                res = __salt__['at.atrm'](jobid)
+                ret['result'] = jobid in res['jobs']['removed']
+                if ret['result']:
+                    ret['comment'] = 'job with id {jobid} was removed'.format(
+                        jobid=jobid
+                    )
+                else:
+                    ret['comment'] = 'failed to remove job with id {jobid}'.format(
+                        jobid=jobid
+                    )
+                ret['changes']['removed'] = res['jobs']['removed']
+                return ret
+        else:
+            ret['result'] = False
+            ret['comment'] = 'more than one job was return for job with id {jobid}'.format(
+                jobid=jobid
+            )
+            return ret
 
-    if fail:
-        ret['comment'] = 'Remove job({0}) from queue but ({1}) fail'.format(
-            ' '.join(opts), fail
-       )
+    # remove jobs based on filter
+    if kwargs:
+        # we pass kwargs to at.jobcheck
+        opts = list(list(map(str, [j['job'] for j in __salt__['at.jobcheck'](**kwargs)['jobs']])))
+        res = __salt__['at.atrm'](*opts)
     else:
-        ret['comment'] = 'Remove job({0}) from queue'.format(' '.join(opts))
+        # arguments to filter with, removing everything!
+        res = __salt__['at.atrm']('all')
+
+    if len(res['jobs']['removed']) > 0:
+        ret['changes']['removed'] = res['jobs']['removed']
+    ret['comment'] = 'removed {count} job(s)'.format(
+        count=len(res['jobs']['removed'])
+    )
+    return ret
+
+
+def watch(name, timespec, tag=None, user=None, job=None, unique_tag=False):
+    '''
+    .. versionadded:: 2017.7.0
+    Add an at job if trigger by watch
+
+    job : string
+        Command to run.
+
+    timespec : string
+        The 'timespec' follows the format documented in the at(1) manpage.
+
+    tag : string
+        Make a tag for the job.
+
+    user : string
+        The user to run the at job
+        .. versionadded:: 2014.1.4
+
+    unique_tag : boolean
+        If set to True job will not be added if a job with the tag exists.
+        .. versionadded:: 2017.7.0
+
+    .. code-block:: yaml
+
+        minion_restart:
+          at.watch:
+            - job: 'salt-call --local service.restart salt-minion'
+            - timespec: 'now +1 min'
+            - tag: minion_restart
+            - unique_tag: trye
+            - watch:
+                - file: /etc/salt/minion
+
+    '''
+    return {
+        'name': name,
+        'changes': {},
+        'result': True,
+        'comment': ''
+    }
+
+
+def mod_watch(name, **kwargs):
+    '''
+    The at watcher, called to invoke the watch command.
+
+    name
+        The name of the atjob
+
+    '''
+    ret = {'name': name,
+           'changes': {},
+           'result': False,
+           'comment': ''}
+
+    if kwargs['sfun'] == 'watch':
+        for p in ['sfun', '__reqs__']:
+            del kwargs[p]
+        kwargs['name'] = name
+        ret = present(**kwargs)
 
     return ret
+
+
+# vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4

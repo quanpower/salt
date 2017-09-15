@@ -11,6 +11,7 @@ config or pillar:
 
 :depends: pypureomapi Python module
 '''
+from __future__ import absolute_import
 # Import python libs
 import logging
 import struct
@@ -32,7 +33,8 @@ def __virtual__():
     '''
     if omapi_support:
         return 'omapi'
-    return False
+    return (False, 'The omapi execution module cannot be loaded: '
+            'the pypureomapi python library is not available.')
 
 
 def _conn():

@@ -1,29 +1,48 @@
 # -*- coding: utf-8 -*-
 '''
-A module for shelling out
+A module for shelling out.
 
 Keep in mind that this module is insecure, in that it can give whomever has
-access to the master root execution access to all salt minions
+access to the master root execution access to all salt minions.
 '''
+from __future__ import absolute_import
 
 # Import python libs
 import functools
-import json
 import glob
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
+import fnmatch
+import base64
+import re
+import tempfile
 
 # Import salt libs
 import salt.utils
+import salt.utils.args
+import salt.utils.files
+import salt.utils.path
+import salt.utils.platform
+import salt.utils.powershell
+import salt.utils.stringutils
+import salt.utils.templates
 import salt.utils.timed_subprocess
+import salt.utils.versions
+import salt.utils.vt
 import salt.grains.extra
-from salt._compat import string_types
-from salt.exceptions import CommandExecutionError, TimedProcTimeoutError
+from salt.ext import six
+from salt.exceptions import CommandExecutionError, TimedProcTimeoutError, \
+    SaltInvocationError
 from salt.log import LOG_LEVELS
+from salt.ext.six.moves import range, zip
+from salt.ext.six.moves import shlex_quote as _cmd_quote
+from salt.utils.locales import sdecode
 
 # Only available on POSIX systems, nonfatal on windows
 try:
@@ -31,6 +50,13 @@ try:
 except ImportError:
     pass
 
+if salt.utils.platform.is_windows():
+    from salt.utils.win_runas import runas as win_runas
+    HAS_WIN_RUNAS = True
+else:
+    HAS_WIN_RUNAS = False
+
+__proxyenabled__ = ['*']
 # Define the module's virtual name
 __virtualname__ = 'cmd'
 
@@ -48,6 +74,36 @@ def __virtual__():
     return __virtualname__
 
 
+def _check_cb(cb_):
+    '''
+    If the callback is None or is not callable, return a lambda that returns
+    the value passed.
+    '''
+    if cb_ is not None:
+        if hasattr(cb_, '__call__'):
+            return cb_
+        else:
+            log.error('log_callback is not callable, ignoring')
+    return lambda x: x
+
+
+def _python_shell_default(python_shell, __pub_jid):
+    '''
+    Set python_shell default based on remote execution and __opts__['cmd_safe']
+    '''
+    try:
+        # Default to python_shell=True when run directly from remote execution
+        # system. Cross-module calls won't have a jid.
+        if __pub_jid and python_shell is None:
+            return True
+        elif __opts__.get('cmd_safe', True) is False and python_shell is None:
+            # Override-switch for python_shell
+            return True
+    except NameError:
+        pass
+    return python_shell
+
+
 def _chroot_pids(chroot):
     pids = []
     for root in glob.glob('/proc/[0-9]*/root'):
@@ -62,92 +118,7 @@ def _chroot_pids(chroot):
     return pids
 
 
-def _chugid(runas):
-    uinfo = pwd.getpwnam(runas)
-    supgroups_seen = set()
-
-    # The line below used to exclude the current user's primary gid.
-    # However, when root belongs to more than one group
-    # this causes root's primary group of '0' to be dropped from
-    # his grouplist.  On FreeBSD, at least, this makes some
-    # command executions fail with 'access denied'.
-    #
-    # The Python documentation says that os.setgroups sets only
-    # the supplemental groups for a running process.  On FreeBSD
-    # this does not appear to be strictly true.
-
-    # supgroups = [
-    #     g.gr_gid for g in grp.getgrall()
-    #     if uinfo.pw_name in g.gr_mem and g.gr_gid != uinfo.pw_gid
-    #        and g.gr_gid not in supgroups_seen and not supgroups_seen.add(g.gr_gid)
-    # ]
-
-    group_list = __salt__['user.list_groups'](runas)
-    supgroups = []
-    for group_name in group_list:
-        gid = __salt__['group.info'](group_name)['gid']
-        if (gid not in supgroups_seen
-           and not supgroups_seen.add(gid)):
-            supgroups.append(gid)
-
-    # No logging can happen on this function
-    #
-    # 08:46:32,161 [salt.loaded.int.module.cmdmod:276 ][DEBUG   ] stderr: Traceback (most recent call last):
-    #   File "/usr/lib/python2.7/logging/__init__.py", line 870, in emit
-    #     self.flush()
-    #   File "/usr/lib/python2.7/logging/__init__.py", line 832, in flush
-    #     self.stream.flush()
-    # IOError: [Errno 9] Bad file descriptor
-    # Logged from file cmdmod.py, line 59
-    # 08:46:17,481 [salt.loaded.int.module.cmdmod:59  ][DEBUG   ] Switching user 0 -> 1008 and group 0 -> 1012 if needed
-    #
-    # apparently because we closed fd's on Popen, though if not closed, output
-    # would also go to its stderr
-
-    if os.getgid() != uinfo.pw_gid:
-        try:
-            os.setgid(uinfo.pw_gid)
-        except OSError as err:
-            raise CommandExecutionError(
-                'Failed to change from gid {0} to {1}. Error: {2}'.format(
-                    os.getgid(), uinfo.pw_gid, err
-                )
-            )
-
-    # Set supplemental groups
-    if sorted(os.getgroups()) != sorted(supgroups):
-        try:
-            os.setgroups(supgroups)
-        except OSError as err:
-            raise CommandExecutionError(
-                'Failed to set supplemental groups to {0}. Error: {1}'.format(
-                    supgroups, err
-                )
-            )
-
-    if os.getuid() != uinfo.pw_uid:
-        try:
-            os.setuid(uinfo.pw_uid)
-        except OSError as err:
-            raise CommandExecutionError(
-                'Failed to change from uid {0} to {1}. Error: {2}'.format(
-                    os.getuid(), uinfo.pw_uid, err
-                )
-            )
-
-
-def _chugid_and_umask(runas, umask):
-    '''
-    Helper method for for subprocess.Popen to initialise uid/gid and umask
-    for the new process.
-    '''
-    if runas is not None:
-        _chugid(runas)
-    if umask is not None:
-        os.umask(umask)
-
-
-def _render_cmd(cmd, cwd, template, saltenv='base'):
+def _render_cmd(cmd, cwd, template, saltenv='base', pillarenv=None, pillar_override=None):
     '''
     If template is a valid template engine, process the cmd and cwd through
     that engine.
@@ -164,26 +135,30 @@ def _render_cmd(cmd, cwd, template, saltenv='base'):
 
     kwargs = {}
     kwargs['salt'] = __salt__
-    kwargs['pillar'] = __pillar__
+    if pillarenv is not None or pillar_override is not None:
+        pillarenv = pillarenv or __opts__['pillarenv']
+        kwargs['pillar'] = _gather_pillar(pillarenv, pillar_override)
+    else:
+        kwargs['pillar'] = __pillar__
     kwargs['grains'] = __grains__
     kwargs['opts'] = __opts__
     kwargs['saltenv'] = saltenv
 
     def _render(contents):
         # write out path to temp file
-        tmp_path_fn = salt.utils.mkstemp()
-        with salt.utils.fopen(tmp_path_fn, 'w+') as fp_:
+        tmp_path_fn = salt.utils.files.mkstemp()
+        with salt.utils.files.fopen(tmp_path_fn, 'w+') as fp_:
             fp_.write(contents)
         data = salt.utils.templates.TEMPLATE_REGISTRY[template](
             tmp_path_fn,
             to_str=True,
             **kwargs
         )
-        salt.utils.safe_rm(tmp_path_fn)
+        salt.utils.files.safe_rm(tmp_path_fn)
         if not data['result']:
             # Failed to render the template
             raise CommandExecutionError(
-                'Failed to cmd with error: {0}'.format(
+                'Failed to execute cmd with error: {0}'.format(
                     data['data']
                 )
             )
@@ -201,16 +176,19 @@ def _check_loglevel(level='info', quiet=False):
     '''
     def _bad_level(level):
         log.error(
-            'Invalid output_loglevel {0!r}. Valid levels are: {1}. Falling '
+            'Invalid output_loglevel \'{0}\'. Valid levels are: {1}. Falling '
             'back to \'info\'.'
             .format(
                 level,
                 ', '.join(
-                    sorted(LOG_LEVELS, key=LOG_LEVELS.get, reverse=True)
+                    sorted(LOG_LEVELS, reverse=True)
                 )
             )
         )
         return LOG_LEVELS['info']
+
+    if salt.utils.is_true(quiet) or str(level).lower() == 'quiet':
+        return None
 
     try:
         level = level.lower()
@@ -219,9 +197,63 @@ def _check_loglevel(level='info', quiet=False):
     except AttributeError:
         return _bad_level(level)
 
-    if salt.utils.is_true(quiet) or level == 'quiet':
-        return None
     return LOG_LEVELS[level]
+
+
+def _parse_env(env):
+    if not env:
+        env = {}
+    if isinstance(env, list):
+        env = salt.utils.repack_dictlist(env)
+    if not isinstance(env, dict):
+        env = {}
+    return env
+
+
+def _gather_pillar(pillarenv, pillar_override):
+    '''
+    Whenever a state run starts, gather the pillar data fresh
+    '''
+    pillar = salt.pillar.get_pillar(
+        __opts__,
+        __grains__,
+        __opts__['id'],
+        __opts__['environment'],
+        pillar_override=pillar_override,
+        pillarenv=pillarenv
+    )
+    ret = pillar.compile_pillar()
+    if pillar_override and isinstance(pillar_override, dict):
+        ret.update(pillar_override)
+    return ret
+
+
+def _check_avail(cmd):
+    '''
+    Check to see if the given command can be run
+    '''
+    if isinstance(cmd, list):
+        cmd = ' '.join([str(x) if not isinstance(x, six.string_types) else x
+                        for x in cmd])
+    bret = True
+    wret = False
+    if __salt__['config.get']('cmd_blacklist_glob'):
+        blist = __salt__['config.get']('cmd_blacklist_glob', [])
+        for comp in blist:
+            if fnmatch.fnmatch(cmd, comp):
+                # BAD! you are blacklisted
+                bret = False
+    if __salt__['config.get']('cmd_whitelist_glob', []):
+        blist = __salt__['config.get']('cmd_whitelist_glob', [])
+        for comp in blist:
+            if fnmatch.fnmatch(cmd, comp):
+                # GOOD! You are whitelisted
+                wret = True
+                break
+    else:
+        # If no whitelist set then alls good!
+        wret = True
+    return bret and wret
 
 
 def _run(cmd,
@@ -230,10 +262,10 @@ def _run(cmd,
          stdout=subprocess.PIPE,
          stderr=subprocess.PIPE,
          output_loglevel='debug',
-         quiet=False,
+         log_callback=None,
          runas=None,
          shell=DEFAULT_SHELL,
-         python_shell=True,
+         python_shell=False,
          env=None,
          clean_env=False,
          rstrip=True,
@@ -242,23 +274,33 @@ def _run(cmd,
          timeout=None,
          with_communicate=True,
          reset_system_locale=True,
-         saltenv='base'):
+         ignore_retcode=False,
+         saltenv='base',
+         pillarenv=None,
+         pillar_override=None,
+         use_vt=False,
+         password=None,
+         bg=False,
+         encoded_cmd=False,
+         **kwargs):
     '''
     Do the DRY thing and only call subprocess.Popen() once
     '''
-    if salt.utils.is_true(quiet):
-        salt.utils.warn_until(
-            'Lithium',
-            'The \'quiet\' option is deprecated and will be removed in the '
-            '\'Lithium\' Salt release. Please use output_loglevel=quiet '
-            'instead.'
-        )
-
-    if not _is_valid_shell(shell):
+    if 'pillar' in kwargs and not pillar_override:
+        pillar_override = kwargs['pillar']
+    if _is_valid_shell(shell) is False:
         log.warning(
             'Attempt to run a shell command with what may be an invalid shell! '
             'Check to ensure that the shell <{0}> is valid for this user.'
             .format(shell))
+
+    log_callback = _check_cb(log_callback)
+
+    if runas is None and '__context__' in globals():
+        runas = __context__.get('runas')
+
+    if password is None and '__context__' in globals():
+        password = __context__.get('runas_password')
 
     # Set the default working directory to the home directory of the user
     # salt-minion is running as. Defaults to home directory of user under which
@@ -272,19 +314,25 @@ def _run(cmd,
         # the euid might not have access to it. See issue #1844
         if not os.access(cwd, os.R_OK):
             cwd = '/'
-            if salt.utils.is_windows():
-                cwd = os.tempnam()[:3]
+            if salt.utils.platform.is_windows():
+                cwd = os.path.abspath(os.sep)
     else:
         # Handle edge cases where numeric/other input is entered, and would be
         # yaml-ified into non-string types
-        cwd = str(cwd)
+        cwd = six.text_type(cwd)
 
-    if not salt.utils.is_windows():
+    if not salt.utils.platform.is_windows():
         if not os.path.isfile(shell) or not os.access(shell, os.X_OK):
             msg = 'The shell {0} is not available'.format(shell)
             raise CommandExecutionError(msg)
+    if salt.utils.platform.is_windows() and use_vt:  # Memozation so not much overhead
+        raise CommandExecutionError('VT not available on windows')
 
     if shell.lower().strip() == 'powershell':
+        # Strip whitespace
+        if isinstance(cmd, six.string_types):
+            cmd = cmd.strip()
+
         # If we were called by script(), then fakeout the Windows
         # shell to run a Powershell script.
         # Else just run a Powershell command.
@@ -294,29 +342,71 @@ def _run(cmd,
         # The last item in the list [-1] is the current method.
         # The third item[2] in each tuple is the name of that method.
         if stack[-2][2] == 'script':
-            cmd = 'Powershell -executionpolicy bypass -File ' + cmd
+            cmd = 'Powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File ' + cmd
+        elif encoded_cmd:
+            cmd = 'Powershell -NonInteractive -EncodedCommand {0}'.format(cmd)
         else:
-            cmd = 'Powershell "{0}"'.format(cmd.replace('"', '\\"'))
+            cmd = 'Powershell -NonInteractive -NoProfile "{0}"'.format(cmd.replace('"', '\\"'))
 
     # munge the cmd and cwd through the template
-    (cmd, cwd) = _render_cmd(cmd, cwd, template, saltenv)
+    (cmd, cwd) = _render_cmd(cmd, cwd, template, saltenv, pillarenv, pillar_override)
 
     ret = {}
 
-    if not env:
-        env = {}
-    if isinstance(env, list):
-        env = salt.utils.repack_dictlist(env)
+    # If the pub jid is here then this is a remote ex or salt call command and needs to be
+    # checked if blacklisted
+    if '__pub_jid' in kwargs:
+        if not _check_avail(cmd):
+            msg = 'This shell command is not permitted: "{0}"'.format(cmd)
+            raise CommandExecutionError(msg)
 
-    for bad_env_key in (x for x, y in env.iteritems() if y is None):
-        log.error('Environment variable {0!r} passed without a value. '
+    env = _parse_env(env)
+
+    for bad_env_key in (x for x, y in six.iteritems(env) if y is None):
+        log.error('Environment variable \'{0}\' passed without a value. '
                   'Setting value to an empty string'.format(bad_env_key))
         env[bad_env_key] = ''
 
-    if runas and salt.utils.is_windows():
-        # TODO: Figure out the proper way to do this in windows
-        msg = 'Sorry, {0} does not support runas functionality'
-        raise CommandExecutionError(msg.format(__grains__['os']))
+    def _get_stripped(cmd):
+        # Return stripped command string copies to improve logging.
+        if isinstance(cmd, list):
+            return [x.strip() if isinstance(x, six.string_types) else x for x in cmd]
+        elif isinstance(cmd, six.string_types):
+            return cmd.strip()
+        else:
+            return cmd
+
+    if _check_loglevel(output_loglevel) is not None:
+        # Always log the shell commands at INFO unless quiet logging is
+        # requested. The command output is what will be controlled by the
+        # 'loglevel' parameter.
+        msg = (
+            u'Executing command {0}{1}{0} {2}in directory \'{3}\'{4}'.format(
+                '\'' if not isinstance(cmd, list) else '',
+                _get_stripped(cmd),
+                'as user \'{0}\' '.format(runas) if runas else '',
+                cwd,
+                '. Executing command in the background, no output will be '
+                'logged.' if bg else ''
+            )
+        )
+        log.info(log_callback(msg))
+
+    if runas and salt.utils.platform.is_windows():
+        if not password:
+            msg = 'password is a required argument for runas on Windows'
+            raise CommandExecutionError(msg)
+
+        if not HAS_WIN_RUNAS:
+            msg = 'missing salt/utils/win_runas.py'
+            raise CommandExecutionError(msg)
+
+        if not isinstance(cmd, list):
+            cmd = salt.utils.args.shlex_split(cmd, posix=False)
+
+        cmd = ' '.join(cmd)
+
+        return win_runas(cmd, runas, password, cwd)
 
     if runas:
         # Save the original command before munging it
@@ -324,59 +414,77 @@ def _run(cmd,
             pwd.getpwnam(runas)
         except KeyError:
             raise CommandExecutionError(
-                'User {0!r} is not available'.format(runas)
+                'User \'{0}\' is not available'.format(runas)
             )
         try:
             # Getting the environment for the runas user
             # There must be a better way to do this.
-            py_code = 'import os, json;' \
-                      'print(json.dumps(os.environ.__dict__))'
+            py_code = (
+                'import sys, os, itertools; '
+                'sys.stdout.write(\"\\0\".join(itertools.chain(*os.environ.items())))'
+            )
             if __grains__['os'] in ['MacOS', 'Darwin']:
-                env_cmd = ('sudo -i -u {1} -- "{2}"'
-                           ).format(shell, runas, sys.executable)
+                env_cmd = ('sudo', '-i', '-u', runas, '--',
+                           sys.executable)
             elif __grains__['os'] in ['FreeBSD']:
-                env_cmd = ('su - {1} -c "{0} -c \'{2}\'"'
-                           ).format(shell, runas, sys.executable)
+                env_cmd = ('su', '-', runas, '-c',
+                           "{0} -c {1}".format(shell, sys.executable))
+            elif __grains__['os_family'] in ['Solaris']:
+                env_cmd = ('su', '-', runas, '-c', sys.executable)
+            elif __grains__['os_family'] in ['AIX']:
+                env_cmd = ('su', runas, '-c', sys.executable)
             else:
-                env_cmd = ('su -s {0} - {1} -c "{2}"'
-                           ).format(shell, runas, sys.executable)
-            env_json = subprocess.Popen(
+                env_cmd = ('su', '-s', shell, '-', runas, '-c', sys.executable)
+            env_encoded = subprocess.Popen(
                 env_cmd,
-                shell=python_shell,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE
-            ).communicate(py_code)[0]
-            env_json = (filter(lambda x: x.startswith('{') and x.endswith('}'),
-                               env_json.splitlines()) or ['{}']).pop()
-            env_runas = json.loads(env_json).get('data', {})
+            ).communicate(py_code.encode(__salt_system_encoding__))[0]
+            if six.PY2:
+                import itertools
+                env_runas = dict(itertools.izip(*[iter(env_encoded.split(b'\0'))]*2))
+            elif six.PY3:
+                if isinstance(env_encoded, str):
+                    env_encoded = env_encoded.encode(__salt_system_encoding__)
+                env_runas = dict(list(zip(*[iter(env_encoded.split(b'\0'))]*2)))
+
+            env_runas = dict((sdecode(k), sdecode(v)) for k, v in six.iteritems(env_runas))
             env_runas.update(env)
             env = env_runas
+            # Encode unicode kwargs to filesystem encoding to avoid a
+            # UnicodeEncodeError when the subprocess is invoked.
+            fse = sys.getfilesystemencoding()
+            for key, val in six.iteritems(env):
+                if isinstance(val, six.text_type):
+                    env[key] = val.encode(fse)
         except ValueError:
             raise CommandExecutionError(
-                'Environment could not be retrieved for User {0!r}'.format(
+                'Environment could not be retrieved for User \'{0}\''.format(
                     runas
                 )
             )
 
-    if _check_loglevel(output_loglevel, quiet) is not None:
-        # Always log the shell commands at INFO unless quiet logging is
-        # requested. The command output is what will be controlled by the
-        # 'loglevel' parameter.
-        log.info(
-            'Executing command {0!r} {1}in directory {2!r}'.format(
-                cmd, 'as user {0!r} '.format(runas) if runas else '', cwd
-            )
-        )
-
     if reset_system_locale is True:
-        if not salt.utils.is_windows():
+        if not salt.utils.platform.is_windows():
             # Default to C!
             # Salt only knows how to parse English words
             # Don't override if the user has passed LC_ALL
-            env.setdefault('LC_ALL', 'C')
+            env.setdefault('LC_CTYPE', 'C')
+            env.setdefault('LC_NUMERIC', 'C')
+            env.setdefault('LC_TIME', 'C')
+            env.setdefault('LC_COLLATE', 'C')
+            env.setdefault('LC_MONETARY', 'C')
+            env.setdefault('LC_MESSAGES', 'C')
+            env.setdefault('LC_PAPER', 'C')
+            env.setdefault('LC_NAME', 'C')
+            env.setdefault('LC_ADDRESS', 'C')
+            env.setdefault('LC_TELEPHONE', 'C')
+            env.setdefault('LC_MEASUREMENT', 'C')
+            env.setdefault('LC_IDENTIFICATION', 'C')
         else:
             # On Windows set the codepage to US English.
-            cmd = 'chcp 437 > nul & ' + cmd
+            if python_shell:
+                cmd = 'chcp 437 > nul & ' + cmd
 
     if clean_env:
         run_env = env
@@ -385,19 +493,29 @@ def _run(cmd,
         run_env = os.environ.copy()
         run_env.update(env)
 
+    if python_shell is None:
+        python_shell = False
+
     kwargs = {'cwd': cwd,
               'shell': python_shell,
               'env': run_env,
               'stdin': str(stdin) if stdin is not None else stdin,
               'stdout': stdout,
               'stderr': stderr,
-              'with_communicate': with_communicate}
+              'with_communicate': with_communicate,
+              'timeout': timeout,
+              'bg': bg,
+              }
 
-    if umask:
+    if umask is not None:
+        _umask = str(umask).lstrip('0')
+
+        if _umask == '':
+            msg = 'Zero umask is not allowed.'
+            raise CommandExecutionError(msg)
+
         try:
-            _umask = int(str(umask).lstrip('0'), 8)
-            if not _umask:
-                raise ValueError('Zero umask not allowed.')
+            _umask = int(_umask, 8)
         except ValueError:
             msg = 'Invalid umask: \'{0}\''.format(umask)
             raise CommandExecutionError(msg)
@@ -406,11 +524,11 @@ def _run(cmd,
 
     if runas or umask:
         kwargs['preexec_fn'] = functools.partial(
-                _chugid_and_umask,
-                runas,
-                _umask)
+            salt.utils.chugid_and_umask,
+            runas,
+            _umask)
 
-    if not salt.utils.is_windows():
+    if not salt.utils.platform.is_windows():
         # close_fds is not supported on Windows platforms if you redirect
         # stdin/stdout/stderr
         if kwargs['shell'] is True:
@@ -419,44 +537,145 @@ def _run(cmd,
 
     if not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise CommandExecutionError(
-            'Specified cwd {0!r} either not absolute or does not exist'
+            'Specified cwd \'{0}\' either not absolute or does not exist'
             .format(cwd)
         )
 
-    # This is where the magic happens
-    try:
-        proc = salt.utils.timed_subprocess.TimedProc(cmd, **kwargs)
-    except (OSError, IOError) as exc:
-        raise CommandExecutionError(
-            'Unable to run command {0!r} with the context {1!r}, reason: {2}'
-            .format(cmd, kwargs, exc)
-        )
+    if python_shell is not True and not isinstance(cmd, list):
+        posix = True
+        if salt.utils.platform.is_windows():
+            posix = False
+        cmd = salt.utils.args.shlex_split(cmd, posix=posix)
+    if not use_vt:
+        # This is where the magic happens
+        try:
+            proc = salt.utils.timed_subprocess.TimedProc(cmd, **kwargs)
+        except (OSError, IOError) as exc:
+            msg = (
+                'Unable to run command \'{0}\' with the context \'{1}\', '
+                'reason: '.format(
+                    cmd if _check_loglevel(output_loglevel) is not None
+                        else 'REDACTED',
+                    kwargs
+                )
+            )
+            try:
+                if exc.filename is None:
+                    msg += 'command not found'
+                else:
+                    msg += '{0}: {1}'.format(exc, exc.filename)
+            except AttributeError:
+                # Both IOError and OSError have the filename attribute, so this
+                # is a precaution in case the exception classes in the previous
+                # try/except are changed.
+                msg += 'unknown'
+            raise CommandExecutionError(msg)
 
-    try:
-        proc.wait(timeout)
-    except TimedProcTimeoutError as exc:
-        ret['stdout'] = str(exc)
-        ret['stderr'] = ''
-        ret['retcode'] = None
+        try:
+            proc.run()
+        except TimedProcTimeoutError as exc:
+            ret['stdout'] = str(exc)
+            ret['stderr'] = ''
+            ret['retcode'] = None
+            ret['pid'] = proc.process.pid
+            # ok return code for timeouts?
+            ret['retcode'] = 1
+            return ret
+
+        try:
+            out = proc.stdout.decode(__salt_system_encoding__)
+        except AttributeError:
+            out = u''
+
+        try:
+            err = proc.stderr.decode(__salt_system_encoding__)
+        except AttributeError:
+            err = u''
+
+        if rstrip:
+            if out is not None:
+                out = out.rstrip()
+            if err is not None:
+                err = err.rstrip()
         ret['pid'] = proc.process.pid
-        # ok return code for timeouts?
-        ret['retcode'] = 1
-        return ret
-
-    out, err = proc.stdout, proc.stderr
-
-    if rstrip:
-        if out is not None:
-            out = out.rstrip()
-        if err is not None:
-            err = err.rstrip()
-
-    ret['stdout'] = out
-    ret['stderr'] = err
-    ret['pid'] = proc.process.pid
-    ret['retcode'] = proc.process.returncode
+        ret['retcode'] = proc.process.returncode
+        ret['stdout'] = out
+        ret['stderr'] = err
+    else:
+        to = ''
+        if timeout:
+            to = ' (timeout: {0}s)'.format(timeout)
+        if _check_loglevel(output_loglevel) is not None:
+            msg = 'Running {0} in VT{1}'.format(cmd, to)
+            log.debug(log_callback(msg))
+        stdout, stderr = '', ''
+        now = time.time()
+        if timeout:
+            will_timeout = now + timeout
+        else:
+            will_timeout = -1
+        try:
+            proc = salt.utils.vt.Terminal(cmd,
+                               shell=True,
+                               log_stdout=True,
+                               log_stderr=True,
+                               cwd=cwd,
+                               preexec_fn=kwargs.get('preexec_fn', None),
+                               env=run_env,
+                               log_stdin_level=output_loglevel,
+                               log_stdout_level=output_loglevel,
+                               log_stderr_level=output_loglevel,
+                               stream_stdout=True,
+                               stream_stderr=True)
+            ret['pid'] = proc.pid
+            while proc.has_unread_data:
+                try:
+                    try:
+                        time.sleep(0.5)
+                        try:
+                            cstdout, cstderr = proc.recv()
+                        except IOError:
+                            cstdout, cstderr = '', ''
+                        if cstdout:
+                            stdout += cstdout
+                        else:
+                            cstdout = ''
+                        if cstderr:
+                            stderr += cstderr
+                        else:
+                            cstderr = ''
+                        if timeout and (time.time() > will_timeout):
+                            ret['stderr'] = (
+                                'SALT: Timeout after {0}s\n{1}').format(
+                                    timeout, stderr)
+                            ret['retcode'] = None
+                            break
+                    except KeyboardInterrupt:
+                        ret['stderr'] = 'SALT: User break\n{0}'.format(stderr)
+                        ret['retcode'] = 1
+                        break
+                except salt.utils.vt.TerminalException as exc:
+                    log.error(
+                        'VT: {0}'.format(exc),
+                        exc_info_on_loglevel=logging.DEBUG)
+                    ret = {'retcode': 1, 'pid': '2'}
+                    break
+                # only set stdout on success as we already mangled in other
+                # cases
+                ret['stdout'] = stdout
+                if not proc.isalive():
+                    # Process terminated, i.e., not canceled by the user or by
+                    # the timeout
+                    ret['stderr'] = stderr
+                    ret['retcode'] = proc.exitstatus
+                ret['pid'] = proc.pid
+        finally:
+            proc.close(terminate=True, kill=True)
     try:
-        __context__['retcode'] = ret['retcode']
+        if ignore_retcode:
+            __context__['retcode'] = 0
+        else:
+            __context__['retcode'] = ret['retcode']
     except NameError:
         # Ignore the context error during grain generation
         pass
@@ -468,13 +687,15 @@ def _run_quiet(cmd,
                stdin=None,
                runas=None,
                shell=DEFAULT_SHELL,
-               python_shell=True,
+               python_shell=False,
                env=None,
                template=None,
                umask=None,
                timeout=None,
                reset_system_locale=True,
-               saltenv='base'):
+               saltenv='base',
+               pillarenv=None,
+               pillar_override=None):
     '''
     Helper for running commands quietly for minion startup
     '''
@@ -484,6 +705,7 @@ def _run_quiet(cmd,
                 stdin=stdin,
                 stderr=subprocess.STDOUT,
                 output_loglevel='quiet',
+                log_callback=None,
                 shell=shell,
                 python_shell=python_shell,
                 env=env,
@@ -491,7 +713,9 @@ def _run_quiet(cmd,
                 umask=umask,
                 timeout=timeout,
                 reset_system_locale=reset_system_locale,
-                saltenv=saltenv)['stdout']
+                saltenv=saltenv,
+                pillarenv=pillarenv,
+                pillar_override=pillar_override)['stdout']
 
 
 def _run_all_quiet(cmd,
@@ -499,16 +723,25 @@ def _run_all_quiet(cmd,
                    stdin=None,
                    runas=None,
                    shell=DEFAULT_SHELL,
-                   python_shell=True,
+                   python_shell=False,
                    env=None,
                    template=None,
                    umask=None,
                    timeout=None,
                    reset_system_locale=True,
-                   saltenv='base'):
+                   saltenv='base',
+                   pillarenv=None,
+                   pillar_override=None,
+                   output_loglevel=None):
+
     '''
     Helper for running commands quietly for minion startup.
-    Returns a dict of return data
+    Returns a dict of return data.
+
+    output_loglevel argument is ignored.  This is here for when we alias
+    cmd.run_all directly to _run_all_quiet in certain chicken-and-egg
+    situations where modules need to work both before and after
+    the __salt__ dictionary is populated (cf dracr.py)
     '''
     return _run(cmd,
                 runas=runas,
@@ -518,11 +751,14 @@ def _run_all_quiet(cmd,
                 python_shell=python_shell,
                 env=env,
                 output_loglevel='quiet',
+                log_callback=None,
                 template=template,
                 umask=umask,
                 timeout=timeout,
                 reset_system_locale=reset_system_locale,
-                saltenv=saltenv)
+                saltenv=saltenv,
+                pillarenv=pillarenv,
+                pillar_override=pillar_override)
 
 
 def run(cmd,
@@ -530,24 +766,141 @@ def run(cmd,
         stdin=None,
         runas=None,
         shell=DEFAULT_SHELL,
-        python_shell=True,
+        python_shell=None,
         env=None,
         clean_env=False,
         template=None,
         rstrip=True,
         umask=None,
         output_loglevel='debug',
-        quiet=False,
+        log_callback=None,
         timeout=None,
         reset_system_locale=True,
         ignore_retcode=False,
         saltenv='base',
+        use_vt=False,
+        bg=False,
+        password=None,
+        encoded_cmd=False,
+        raise_err=False,
         **kwargs):
-    '''
+    r'''
     Execute the passed command and return the output as a string
 
     Note that ``env`` represents the environment variables for the command, and
     should be formatted as a dict, or a YAML string which resolves to a dict.
+
+    :param str cmd: The command to run. ex: ``ls -lart /home``
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If ``False``, let python handle the positional
+      arguments. Set to ``True`` to use shell features, such as pipes or
+      redirection.
+
+    :param bool bg: If ``True``, run command in background and do not await or
+      deliver it's results
+
+      .. versionadded:: 2016.3.0
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    :param bool encoded_cmd: Specify if the supplied command is encoded.
+      Only applies to shell 'powershell'.
+
+    :param bool raise_err: Specifies whether to raise a CommandExecutionError.
+      If False, the error will be logged, but no exception will be raised.
+      Default is False.
+
+    .. warning::
+        This function does not process commands through a shell
+        unless the python_shell flag is set to True. This means that any
+        shell-specific functionality such as 'echo' or the use of pipes,
+        redirection or &&, should either be migrated to cmd.shell or
+        have the python_shell=True flag set here.
+
+        The use of python_shell=True means that the shell will accept _any_ input
+        including potentially malicious commands such as 'good_command;rm -rf /'.
+        Be absolutely certain that you have sanitized your input prior to using
+        python_shell=True
 
     CLI Example:
 
@@ -586,6 +939,8 @@ def run(cmd,
 
         salt '*' cmd.run cmd='sed -e s/=/:/g'
     '''
+    python_shell = _python_shell_default(python_shell,
+                                         kwargs.get('__pub_jid', ''))
     ret = _run(cmd,
                runas=runas,
                shell=shell,
@@ -599,39 +954,225 @@ def run(cmd,
                rstrip=rstrip,
                umask=umask,
                output_loglevel=output_loglevel,
-               quiet=quiet,
+               log_callback=log_callback,
                timeout=timeout,
                reset_system_locale=reset_system_locale,
-               saltenv=saltenv)
+               ignore_retcode=ignore_retcode,
+               saltenv=saltenv,
+               use_vt=use_vt,
+               bg=bg,
+               password=password,
+               encoded_cmd=encoded_cmd,
+               **kwargs)
 
-    if 'pid' in ret and '__pub_jid' in kwargs:
-        # Stuff the child pid in the JID file
-        proc_dir = os.path.join(__opts__['cachedir'], 'proc')
-        jid_file = os.path.join(proc_dir, kwargs['__pub_jid'])
-        if os.path.isfile(jid_file):
-            serial = salt.payload.Serial(__opts__)
-            with salt.utils.fopen(jid_file, 'rb') as fn_:
-                jid_dict = serial.load(fn_)
+    log_callback = _check_cb(log_callback)
 
-            if 'child_pids' in jid_dict:
-                jid_dict['child_pids'].append(ret['pid'])
-            else:
-                jid_dict['child_pids'] = [ret['pid']]
-            # Rewrite file
-            with salt.utils.fopen(jid_file, 'w+b') as fn_:
-                fn_.write(serial.dumps(jid_dict))
-
-    lvl = _check_loglevel(output_loglevel, quiet)
+    lvl = _check_loglevel(output_loglevel)
     if lvl is not None:
         if not ignore_retcode and ret['retcode'] != 0:
             if lvl < LOG_LEVELS['error']:
                 lvl = LOG_LEVELS['error']
-            log.error(
-                'Command {0!r} failed with return code: {1}'
-                .format(cmd, ret['retcode'])
+            msg = (
+                'Command \'{0}\' failed with return code: {1}'.format(
+                    cmd,
+                    ret['retcode']
+                )
             )
-        log.log(lvl, 'output: {0}'.format(ret['stdout']))
+            log.error(log_callback(msg))
+            if raise_err:
+                raise CommandExecutionError(log_callback(ret['stdout']))
+        log.log(lvl, u'output: %s', log_callback(ret['stdout']))
     return ret['stdout']
+
+
+def shell(cmd,
+        cwd=None,
+        stdin=None,
+        runas=None,
+        shell=DEFAULT_SHELL,
+        env=None,
+        clean_env=False,
+        template=None,
+        rstrip=True,
+        umask=None,
+        output_loglevel='debug',
+        log_callback=None,
+        quiet=False,
+        timeout=None,
+        reset_system_locale=True,
+        ignore_retcode=False,
+        saltenv='base',
+        use_vt=False,
+        bg=False,
+        password=None,
+        **kwargs):
+    '''
+    Execute the passed command and return the output as a string.
+
+    .. versionadded:: 2015.5.0
+
+    :param str cmd: The command to run. ex: 'ls -lart /home'
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param int shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool bg: If True, run command in background and do not await or
+      deliver its results
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    .. warning::
+
+        This passes the cmd argument directly to the shell
+        without any further processing! Be absolutely sure that you
+        have properly sanitized the command passed to this function
+        and do not use untrusted inputs.
+
+    .. note::
+
+        ``env`` represents the environment variables for the command, and
+        should be formatted as a dict, or a YAML string which resolves to a dict.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.shell "ls -l | awk '/foo/{print \\$2}'"
+
+    The template arg can be set to 'jinja' or another supported template
+    engine to render the command arguments before execution.
+    For example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.shell template=jinja "ls -l /tmp/{{grains.id}} | awk '/foo/{print \\$2}'"
+
+    Specify an alternate shell with the shell parameter:
+
+    .. code-block:: bash
+
+        salt '*' cmd.shell "Get-ChildItem C:\\ " shell='powershell'
+
+    A string of standard input can be specified for the command to be run using
+    the ``stdin`` parameter. This can be useful in cases where sensitive
+    information must be read from standard input.:
+
+    .. code-block:: bash
+
+        salt '*' cmd.shell "grep f" stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
+
+    If an equal sign (``=``) appears in an argument to a Salt command it is
+    interpreted as a keyword argument in the format ``key=val``. That
+    processing can be bypassed in order to pass an equal sign through to the
+    remote shell command by manually specifying the kwarg:
+
+    .. code-block:: bash
+
+        salt '*' cmd.shell cmd='sed -e s/=/:/g'
+    '''
+    if 'python_shell' in kwargs:
+        python_shell = kwargs.pop('python_shell')
+    else:
+        python_shell = True
+    return run(cmd,
+               cwd=cwd,
+               stdin=stdin,
+               runas=runas,
+               shell=shell,
+               env=env,
+               clean_env=clean_env,
+               template=template,
+               rstrip=rstrip,
+               umask=umask,
+               output_loglevel=output_loglevel,
+               log_callback=log_callback,
+               quiet=quiet,
+               timeout=timeout,
+               reset_system_locale=reset_system_locale,
+               ignore_retcode=ignore_retcode,
+               saltenv=saltenv,
+               use_vt=use_vt,
+               python_shell=python_shell,
+               bg=bg,
+               password=password,
+               **kwargs)
 
 
 def run_stdout(cmd,
@@ -639,24 +1180,113 @@ def run_stdout(cmd,
                stdin=None,
                runas=None,
                shell=DEFAULT_SHELL,
-               python_shell=True,
+               python_shell=None,
                env=None,
                clean_env=False,
                template=None,
                rstrip=True,
                umask=None,
                output_loglevel='debug',
-               quiet=False,
+               log_callback=None,
                timeout=None,
                reset_system_locale=True,
                ignore_retcode=False,
                saltenv='base',
+               use_vt=False,
+               password=None,
                **kwargs):
     '''
     Execute a command, and only return the standard out
 
-    Note that ``env`` represents the environment variables for the command, and
-    should be formatted as a dict, or a YAML string which resolves to a dict.
+    :param str cmd: The command to run. ex: 'ls -lart /home'
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    .. note::
+      ``env`` represents the environment variables for the command, and
+      should be formatted as a dict, or a YAML string which resolves to a dict.
 
     CLI Example:
 
@@ -680,6 +1310,8 @@ def run_stdout(cmd,
 
         salt '*' cmd.run_stdout "grep f" stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     '''
+    python_shell = _python_shell_default(python_shell,
+                                         kwargs.get('__pub_jid', ''))
     ret = _run(cmd,
                runas=runas,
                cwd=cwd,
@@ -692,24 +1324,33 @@ def run_stdout(cmd,
                rstrip=rstrip,
                umask=umask,
                output_loglevel=output_loglevel,
-               quiet=quiet,
+               log_callback=log_callback,
                timeout=timeout,
                reset_system_locale=reset_system_locale,
-               saltenv=saltenv)
+               ignore_retcode=ignore_retcode,
+               saltenv=saltenv,
+               use_vt=use_vt,
+               password=password,
+               **kwargs)
 
-    lvl = _check_loglevel(output_loglevel, quiet)
+    log_callback = _check_cb(log_callback)
+
+    lvl = _check_loglevel(output_loglevel)
     if lvl is not None:
         if not ignore_retcode and ret['retcode'] != 0:
             if lvl < LOG_LEVELS['error']:
                 lvl = LOG_LEVELS['error']
-            log.error(
-                'Command {0!r} failed with return code: {1}'
-                .format(cmd, ret['retcode'])
+            msg = (
+                'Command \'{0}\' failed with return code: {1}'.format(
+                    cmd,
+                    ret['retcode']
+                )
             )
+            log.error(log_callback(msg))
         if ret['stdout']:
-            log.log(lvl, 'stdout: {0}'.format(ret['stdout']))
+            log.log(lvl, 'stdout: {0}'.format(log_callback(ret['stdout'])))
         if ret['stderr']:
-            log.log(lvl, 'stderr: {0}'.format(ret['stderr']))
+            log.log(lvl, 'stderr: {0}'.format(log_callback(ret['stderr'])))
         if ret['retcode']:
             log.log(lvl, 'retcode: {0}'.format(ret['retcode']))
     return ret['stdout']
@@ -720,24 +1361,114 @@ def run_stderr(cmd,
                stdin=None,
                runas=None,
                shell=DEFAULT_SHELL,
-               python_shell=True,
+               python_shell=None,
                env=None,
                clean_env=False,
                template=None,
                rstrip=True,
                umask=None,
                output_loglevel='debug',
-               quiet=False,
+               log_callback=None,
                timeout=None,
                reset_system_locale=True,
                ignore_retcode=False,
                saltenv='base',
+               use_vt=False,
+               password=None,
                **kwargs):
     '''
     Execute a command and only return the standard error
 
-    Note that ``env`` represents the environment variables for the command, and
-    should be formatted as a dict, or a YAML string which resolves to a dict.
+    :param str cmd: The command to run. ex: 'ls -lart /home'
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    .. note::
+      ``env`` represents the environment variables for the command, and
+      should be formatted as a dict, or a YAML string which resolves to a dict.
 
     CLI Example:
 
@@ -761,6 +1492,8 @@ def run_stderr(cmd,
 
         salt '*' cmd.run_stderr "grep f" stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     '''
+    python_shell = _python_shell_default(python_shell,
+                                         kwargs.get('__pub_jid', ''))
     ret = _run(cmd,
                runas=runas,
                cwd=cwd,
@@ -773,24 +1506,33 @@ def run_stderr(cmd,
                rstrip=rstrip,
                umask=umask,
                output_loglevel=output_loglevel,
-               quiet=quiet,
+               log_callback=log_callback,
                timeout=timeout,
                reset_system_locale=reset_system_locale,
-               saltenv=saltenv)
+               ignore_retcode=ignore_retcode,
+               use_vt=use_vt,
+               saltenv=saltenv,
+               password=password,
+               **kwargs)
 
-    lvl = _check_loglevel(output_loglevel, quiet)
+    log_callback = _check_cb(log_callback)
+
+    lvl = _check_loglevel(output_loglevel)
     if lvl is not None:
         if not ignore_retcode and ret['retcode'] != 0:
             if lvl < LOG_LEVELS['error']:
                 lvl = LOG_LEVELS['error']
-            log.error(
-                'Command {0!r} failed with return code: {1}'
-                .format(cmd, ret['retcode'])
+            msg = (
+                'Command \'{0}\' failed with return code: {1}'.format(
+                    cmd,
+                    ret['retcode']
+                )
             )
+            log.error(log_callback(msg))
         if ret['stdout']:
-            log.log(lvl, 'stdout: {0}'.format(ret['stdout']))
+            log.log(lvl, 'stdout: {0}'.format(log_callback(ret['stdout'])))
         if ret['stderr']:
-            log.log(lvl, 'stderr: {0}'.format(ret['stderr']))
+            log.log(lvl, 'stderr: {0}'.format(log_callback(ret['stderr'])))
         if ret['retcode']:
             log.log(lvl, 'retcode: {0}'.format(ret['retcode']))
     return ret['stderr']
@@ -801,24 +1543,138 @@ def run_all(cmd,
             stdin=None,
             runas=None,
             shell=DEFAULT_SHELL,
-            python_shell=True,
+            python_shell=None,
             env=None,
             clean_env=False,
             template=None,
             rstrip=True,
             umask=None,
             output_loglevel='debug',
-            quiet=False,
+            log_callback=None,
             timeout=None,
             reset_system_locale=True,
             ignore_retcode=False,
             saltenv='base',
+            use_vt=False,
+            redirect_stderr=False,
+            password=None,
+            encoded_cmd=False,
             **kwargs):
     '''
     Execute the passed command and return a dict of return data
 
-    Note that ``env`` represents the environment variables for the command, and
-    should be formatted as a dict, or a YAML string which resolves to a dict.
+    :param str cmd: The command to run. ex: 'ls -lart /home'
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    .. note::
+      ``env`` represents the environment variables for the command, and
+      should be formatted as a dict, or a YAML string which resolves to a dict.
+
+    :param bool encoded_cmd: Specify if the supplied command is encoded.
+      Only applies to shell 'powershell'.
+
+      .. versionadded:: Oxygen
+
+    :param bool redirect_stderr: If set to ``True``, then stderr will be
+      redirected to stdout. This is helpful for cases where obtaining both the
+      retcode and output is desired, but it is not desired to have the output
+      separated into both stdout and stderr.
+
+        .. versionadded:: 2015.8.2
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param bool bg: If ``True``, run command in background and do not await or
+      deliver it's results
+
+      .. versionadded:: 2016.3.6
 
     CLI Example:
 
@@ -842,10 +1698,14 @@ def run_all(cmd,
 
         salt '*' cmd.run_all "grep f" stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     '''
+    python_shell = _python_shell_default(python_shell,
+                                         kwargs.get('__pub_jid', ''))
+    stderr = subprocess.STDOUT if redirect_stderr else subprocess.PIPE
     ret = _run(cmd,
                runas=runas,
                cwd=cwd,
                stdin=stdin,
+               stderr=stderr,
                shell=shell,
                python_shell=python_shell,
                env=env,
@@ -854,24 +1714,34 @@ def run_all(cmd,
                rstrip=rstrip,
                umask=umask,
                output_loglevel=output_loglevel,
-               quiet=quiet,
+               log_callback=log_callback,
                timeout=timeout,
                reset_system_locale=reset_system_locale,
-               saltenv=saltenv)
+               ignore_retcode=ignore_retcode,
+               saltenv=saltenv,
+               use_vt=use_vt,
+               password=password,
+               encoded_cmd=encoded_cmd,
+               **kwargs)
 
-    lvl = _check_loglevel(output_loglevel, quiet)
+    log_callback = _check_cb(log_callback)
+
+    lvl = _check_loglevel(output_loglevel)
     if lvl is not None:
         if not ignore_retcode and ret['retcode'] != 0:
             if lvl < LOG_LEVELS['error']:
                 lvl = LOG_LEVELS['error']
-            log.error(
-                'Command {0!r} failed with return code: {1}'
-                .format(cmd, ret['retcode'])
+            msg = (
+                'Command \'{0}\' failed with return code: {1}'.format(
+                    cmd,
+                    ret['retcode']
+                )
             )
+            log.error(log_callback(msg))
         if ret['stdout']:
-            log.log(lvl, 'stdout: {0}'.format(ret['stdout']))
+            log.log(lvl, u'stdout: {0}'.format(log_callback(ret['stdout'])))
         if ret['stderr']:
-            log.log(lvl, 'stderr: {0}'.format(ret['stderr']))
+            log.log(lvl, u'stderr: {0}'.format(log_callback(ret['stderr'])))
         if ret['retcode']:
             log.log(lvl, 'retcode: {0}'.format(ret['retcode']))
     return ret
@@ -882,23 +1752,117 @@ def retcode(cmd,
             stdin=None,
             runas=None,
             shell=DEFAULT_SHELL,
-            python_shell=True,
+            python_shell=None,
             env=None,
             clean_env=False,
             template=None,
             umask=None,
             output_loglevel='debug',
-            quiet=False,
+            log_callback=None,
             timeout=None,
             reset_system_locale=True,
             ignore_retcode=False,
             saltenv='base',
+            use_vt=False,
+            password=None,
             **kwargs):
     '''
     Execute a shell command and return the command's return code.
 
-    Note that ``env`` represents the environment variables for the command, and
-    should be formatted as a dict, or a YAML string which resolves to a dict.
+    :param str cmd: The command to run. ex: 'ls -lart /home'
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    .. note::
+      ``env`` represents the environment variables for the command, and
+      should be formatted as a dict, or a YAML string which resolves to a dict.
+
+    :rtype: int
+    :rtype: None
+    :returns: Return Code as an int or None if there was an exception.
 
     CLI Example:
 
@@ -923,32 +1887,41 @@ def retcode(cmd,
         salt '*' cmd.retcode "grep f" stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     '''
     ret = _run(cmd,
-              runas=runas,
-              cwd=cwd,
-              stdin=stdin,
-              stderr=subprocess.STDOUT,
-              shell=shell,
-              python_shell=python_shell,
-              env=env,
-              clean_env=clean_env,
-              template=template,
-              umask=umask,
-              output_loglevel=output_loglevel,
-              quiet=quiet,
-              timeout=timeout,
-              reset_system_locale=reset_system_locale,
-              saltenv=saltenv)
+               runas=runas,
+               cwd=cwd,
+               stdin=stdin,
+               stderr=subprocess.STDOUT,
+               shell=shell,
+               python_shell=python_shell,
+               env=env,
+               clean_env=clean_env,
+               template=template,
+               umask=umask,
+               output_loglevel=output_loglevel,
+               log_callback=log_callback,
+               timeout=timeout,
+               reset_system_locale=reset_system_locale,
+               ignore_retcode=ignore_retcode,
+               saltenv=saltenv,
+               use_vt=use_vt,
+               password=password,
+               **kwargs)
 
-    lvl = _check_loglevel(output_loglevel, quiet)
+    log_callback = _check_cb(log_callback)
+
+    lvl = _check_loglevel(output_loglevel)
     if lvl is not None:
         if not ignore_retcode and ret['retcode'] != 0:
             if lvl < LOG_LEVELS['error']:
                 lvl = LOG_LEVELS['error']
-            log.error(
-                'Command {0!r} failed with return code: {1}'
-                .format(cmd, ret['retcode'])
+            msg = (
+                'Command \'{0}\' failed with return code: {1}'.format(
+                    cmd,
+                    ret['retcode']
+                )
             )
-        log.log(lvl, 'output: {0}'.format(ret['stdout']))
+            log.error(log_callback(msg))
+        log.log(lvl, 'output: {0}'.format(log_callback(ret['stdout'])))
     return ret['retcode']
 
 
@@ -957,17 +1930,19 @@ def _retcode_quiet(cmd,
                    stdin=None,
                    runas=None,
                    shell=DEFAULT_SHELL,
-                   python_shell=True,
+                   python_shell=False,
                    env=None,
                    clean_env=False,
                    template=None,
                    umask=None,
                    output_loglevel='quiet',
-                   quiet=True,
+                   log_callback=None,
                    timeout=None,
                    reset_system_locale=True,
                    ignore_retcode=False,
                    saltenv='base',
+                   use_vt=False,
+                   password=None,
                    **kwargs):
     '''
     Helper for running commands quietly for minion startup.
@@ -984,10 +1959,13 @@ def _retcode_quiet(cmd,
                    template=template,
                    umask=umask,
                    output_loglevel=output_loglevel,
+                   log_callback=log_callback,
                    timeout=timeout,
                    reset_system_locale=reset_system_locale,
                    ignore_retcode=ignore_retcode,
                    saltenv=saltenv,
+                   use_vt=use_vt,
+                   password=password,
                    **kwargs)
 
 
@@ -997,16 +1975,19 @@ def script(source,
            stdin=None,
            runas=None,
            shell=DEFAULT_SHELL,
-           python_shell=True,
+           python_shell=None,
            env=None,
-           template='jinja',
+           template=None,
            umask=None,
            output_loglevel='debug',
+           log_callback=None,
            quiet=False,
            timeout=None,
            reset_system_locale=True,
-           __env__=None,
            saltenv='base',
+           use_vt=False,
+           bg=False,
+           password=None,
            **kwargs):
     '''
     Download a script from a remote location and execute the script locally.
@@ -1016,8 +1997,100 @@ def script(source,
     The script will be executed directly, so it can be written in any available
     programming language.
 
-    The script can also be formatted as a template, the default is jinja.
-    Arguments for the script can be specified as well.
+    :param str source: The location of the script to download. If the file is
+      located on the master in the directory named spam, and is called eggs, the
+      source string is salt://spam/eggs
+
+    :param str args: String of command line args to pass to the script.  Only
+      used if no args are specified as part of the `name` argument. To pass a
+      string containing spaces in YAML, you will need to doubly-quote it:
+      "arg1 'arg two' arg3"
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run script as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param bool bg: If True, run script in background and do not await or deliver it's results
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG)regardless, unless ``quiet`` is used for this value.
+
+    :param bool quiet: The command will be executed quietly, meaning no log
+      entries of the actual command or its return data. This is deprecated as of
+      the **2014.1.0** release, and is being replaced with ``output_loglevel: quiet``.
+
+    :param int timeout: If the command has not terminated after timeout seconds,
+      send the subprocess sigterm, and if sigterm is ignored, follow up with
+      sigkill
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
 
     CLI Example:
 
@@ -1027,40 +2100,51 @@ def script(source,
         salt '*' cmd.script salt://scripts/runme.sh 'arg1 arg2 "arg 3"'
         salt '*' cmd.script salt://scripts/windows_task.ps1 args=' -Input c:\\tmp\\infile.txt' shell='powershell'
 
-    A string of standard input can be specified for the command to be run using
-    the ``stdin`` parameter. This can be useful in cases where sensitive
-    information must be read from standard input.:
 
     .. code-block:: bash
 
         salt '*' cmd.script salt://scripts/runme.sh stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     '''
+    python_shell = _python_shell_default(python_shell,
+                                         kwargs.get('__pub_jid', ''))
+
     def _cleanup_tempfile(path):
         try:
-            os.remove(path)
-        except (IOError, OSError) as exc:
-            log.error('cmd.script: Unable to clean tempfile {0!r}: {1}'
-                      .format(path, exc))
+            __salt__['file.remove'](path)
+        except (SaltInvocationError, CommandExecutionError) as exc:
+            log.error(
+                'cmd.script: Unable to clean tempfile \'{0}\': {1}'.format(
+                    path,
+                    exc
+                )
+            )
 
-    if isinstance(__env__, string_types):
-        salt.utils.warn_until(
-            'Boron',
-            'Passing a salt environment should be done using \'saltenv\' not '
-            '\'__env__\'. This functionality will be removed in Salt Boron.'
-        )
-        # Backwards compatibility
-        saltenv = __env__
+    if '__env__' in kwargs:
+        # "env" is not supported; Use "saltenv".
+        kwargs.pop('__env__')
 
-    path = salt.utils.mkstemp(dir=cwd, suffix=os.path.splitext(source)[1])
+    if salt.utils.platform.is_windows() and runas and cwd is None:
+        cwd = tempfile.mkdtemp(dir=__opts__['cachedir'])
+        __salt__['win_dacl.add_ace'](
+            cwd, 'File', runas, 'READ&EXECUTE', 'ALLOW',
+            'FOLDER&SUBFOLDERS&FILES')
+
+    path = salt.utils.files.mkstemp(dir=cwd, suffix=os.path.splitext(source)[1])
 
     if template:
+        if 'pillarenv' in kwargs or 'pillar' in kwargs:
+            pillarenv = kwargs.get('pillarenv', __opts__.get('pillarenv'))
+            kwargs['pillar'] = _gather_pillar(pillarenv, kwargs.get('pillar'))
         fn_ = __salt__['cp.get_template'](source,
                                           path,
                                           template,
                                           saltenv,
                                           **kwargs)
         if not fn_:
-            _cleanup_tempfile(path)
+            if salt.utils.platform.is_windows() and runas:
+                _cleanup_tempfile(cwd)
+            else:
+                _cleanup_tempfile(path)
             return {'pid': 0,
                     'retcode': 1,
                     'stdout': '',
@@ -1069,21 +2153,24 @@ def script(source,
     else:
         fn_ = __salt__['cp.cache_file'](source, saltenv)
         if not fn_:
-            _cleanup_tempfile(path)
+            if salt.utils.platform.is_windows() and runas:
+                _cleanup_tempfile(cwd)
+            else:
+                _cleanup_tempfile(path)
             return {'pid': 0,
                     'retcode': 1,
                     'stdout': '',
                     'stderr': '',
                     'cache_error': True}
         shutil.copyfile(fn_, path)
-    if not salt.utils.is_windows():
+    if not salt.utils.platform.is_windows():
         os.chmod(path, 320)
         os.chown(path, __salt__['file.user_to_uid'](runas), -1)
     ret = _run(path + ' ' + str(args) if args else path,
                cwd=cwd,
                stdin=stdin,
                output_loglevel=output_loglevel,
-               quiet=quiet,
+               log_callback=log_callback,
                runas=runas,
                shell=shell,
                python_shell=python_shell,
@@ -1091,24 +2178,35 @@ def script(source,
                umask=umask,
                timeout=timeout,
                reset_system_locale=reset_system_locale,
-               saltenv=saltenv)
-    _cleanup_tempfile(path)
+               saltenv=saltenv,
+               use_vt=use_vt,
+               bg=bg,
+               password=password,
+               **kwargs)
+    if salt.utils.platform.is_windows() and runas:
+        _cleanup_tempfile(cwd)
+    else:
+        _cleanup_tempfile(path)
     return ret
 
 
 def script_retcode(source,
+                   args=None,
                    cwd=None,
                    stdin=None,
                    runas=None,
                    shell=DEFAULT_SHELL,
-                   python_shell=True,
+                   python_shell=None,
                    env=None,
                    template='jinja',
                    umask=None,
                    timeout=None,
                    reset_system_locale=True,
-                   __env__=None,
                    saltenv='base',
+                   output_loglevel='debug',
+                   log_callback=None,
+                   use_vt=False,
+                   password=None,
                    **kwargs):
     '''
     Download a script from a remote location and execute the script locally.
@@ -1122,11 +2220,107 @@ def script_retcode(source,
 
     Only evaluate the script return code and do not block for terminal output
 
+    :param str source: The location of the script to download. If the file is
+      located on the master in the directory named spam, and is called eggs, the
+      source string is salt://spam/eggs
+
+    :param str args: String of command line args to pass to the script. Only
+      used if no args are specified as part of the `name` argument. To pass a
+      string containing spaces in YAML, you will need to doubly-quote it:  "arg1
+      'arg two' arg3"
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run script as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param bool quiet: The command will be executed quietly, meaning no log
+      entries of the actual command or its return data. This is deprecated as of
+      the **2014.1.0** release, and is being replaced with ``output_loglevel:
+      quiet``.
+
+    :param int timeout: If the command has not terminated after timeout seconds,
+      send the subprocess sigterm, and if sigterm is ignored, follow up with
+      sigkill
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
     CLI Example:
 
     .. code-block:: bash
 
         salt '*' cmd.script_retcode salt://scripts/runme.sh
+        salt '*' cmd.script_retcode salt://scripts/runme.sh 'arg1 arg2 "arg 3"'
+        salt '*' cmd.script_retcode salt://scripts/windows_task.ps1 args=' -Input c:\\tmp\\infile.txt' shell='powershell'
 
     A string of standard input can be specified for the command to be run using
     the ``stdin`` parameter. This can be useful in cases where sensitive
@@ -1136,16 +2330,12 @@ def script_retcode(source,
 
         salt '*' cmd.script_retcode salt://scripts/runme.sh stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     '''
-    if isinstance(__env__, string_types):
-        salt.utils.warn_until(
-            'Boron',
-            'Passing a salt environment should be done using \'saltenv\' not '
-            '\'env\'. This functionality will be removed in Salt Boron.'
-        )
-        # Backwards compatibility
-        saltenv = __env__
+    if '__env__' in kwargs:
+        # "env" is not supported; Use "saltenv".
+        kwargs.pop('__env__')
 
     return script(source=source,
+                  args=args,
                   cwd=cwd,
                   stdin=stdin,
                   runas=runas,
@@ -1157,6 +2347,10 @@ def script_retcode(source,
                   timeout=timeout,
                   reset_system_locale=reset_system_locale,
                   saltenv=saltenv,
+                  output_loglevel=output_loglevel,
+                  log_callback=log_callback,
+                  use_vt=use_vt,
+                  password=password,
                   **kwargs)['retcode']
 
 
@@ -1170,7 +2364,7 @@ def which(cmd):
 
         salt '*' cmd.which cat
     '''
-    return salt.utils.which(cmd)
+    return salt.utils.path.which(cmd)
 
 
 def which_bin(cmds):
@@ -1183,7 +2377,7 @@ def which_bin(cmds):
 
         salt '*' cmd.which_bin '[pip2, pip, pip-python]'
     '''
-    return salt.utils.which_bin(cmds)
+    return salt.utils.path.which_bin(cmds)
 
 
 def has_exec(cmd):
@@ -1199,38 +2393,221 @@ def has_exec(cmd):
     return which(cmd) is not None
 
 
-def exec_code(lang, code, cwd=None):
+def exec_code(lang, code, cwd=None, args=None, **kwargs):
     '''
     Pass in two strings, the first naming the executable language, aka -
     python2, python3, ruby, perl, lua, etc. the second string containing
-    the code you wish to execute. The stdout and stderr will be returned
+    the code you wish to execute. The stdout will be returned.
+
+    All parameters from :mod:`cmd.run_all <salt.modules.cmdmod.run_all>` except python_shell can be used.
 
     CLI Example:
 
     .. code-block:: bash
 
         salt '*' cmd.exec_code ruby 'puts "cheese"'
+        salt '*' cmd.exec_code ruby 'puts "cheese"' args='["arg1", "arg2"]' env='{"FOO": "bar"}'
     '''
-    codefile = salt.utils.mkstemp()
-    with salt.utils.fopen(codefile, 'w+') as fp_:
-        fp_.write(code)
-
-    cmd = '{0} {1}'.format(lang, codefile)
-    ret = run(cmd, cwd=cwd)
-    os.remove(codefile)
-    return ret
+    return exec_code_all(lang, code, cwd, args, **kwargs)['stdout']
 
 
-def run_chroot(root, cmd):
+def exec_code_all(lang, code, cwd=None, args=None, **kwargs):
     '''
-    Chroot into a directory and run a cmd, this routines calls cmd.run_all
-    wrapped in `chroot` with dev and proc mounted in the chroot
+    Pass in two strings, the first naming the executable language, aka -
+    python2, python3, ruby, perl, lua, etc. the second string containing
+    the code you wish to execute. All cmd artifacts (stdout, stderr, retcode, pid)
+    will be returned.
+
+    All parameters from :mod:`cmd.run_all <salt.modules.cmdmod.run_all>` except python_shell can be used.
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' cmd.chroot_run /var/lib/lxc/container_name/rootfs 'sh /tmp/bootstrap.sh'
+        salt '*' cmd.exec_code_all ruby 'puts "cheese"'
+        salt '*' cmd.exec_code_all ruby 'puts "cheese"' args='["arg1", "arg2"]' env='{"FOO": "bar"}'
+    '''
+    powershell = lang.lower().startswith("powershell")
+
+    if powershell:
+        codefile = salt.utils.files.mkstemp(suffix=".ps1")
+    else:
+        codefile = salt.utils.files.mkstemp()
+
+    with salt.utils.files.fopen(codefile, 'w+t', binary=False) as fp_:
+        fp_.write(code)
+
+    if powershell:
+        cmd = [lang, "-File", codefile]
+    else:
+        cmd = [lang, codefile]
+
+    if isinstance(args, six.string_types):
+        cmd.append(args)
+    elif isinstance(args, list):
+        cmd += args
+
+    ret = run_all(cmd, cwd=cwd, python_shell=False, **kwargs)
+    os.remove(codefile)
+    return ret
+
+
+def tty(device, echo=''):
+    '''
+    Echo a string to a specific tty
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.tty tty0 'This is a test'
+        salt '*' cmd.tty pts3 'This is a test'
+    '''
+    if device.startswith('tty'):
+        teletype = '/dev/{0}'.format(device)
+    elif device.startswith('pts'):
+        teletype = '/dev/{0}'.format(device.replace('pts', 'pts/'))
+    else:
+        return {'Error': 'The specified device is not a valid TTY'}
+    try:
+        with salt.utils.files.fopen(teletype, 'wb') as tty_device:
+            tty_device.write(salt.utils.stringutils.to_bytes(echo))
+        return {
+            'Success': 'Message was successfully echoed to {0}'.format(teletype)
+        }
+    except IOError:
+        return {
+            'Error': 'Echoing to {0} returned error'.format(teletype)
+        }
+
+
+def run_chroot(root,
+               cmd,
+               cwd=None,
+               stdin=None,
+               runas=None,
+               shell=DEFAULT_SHELL,
+               python_shell=True,
+               env=None,
+               clean_env=False,
+               template=None,
+               rstrip=True,
+               umask=None,
+               output_loglevel='quiet',
+               log_callback=None,
+               quiet=False,
+               timeout=None,
+               reset_system_locale=True,
+               ignore_retcode=False,
+               saltenv='base',
+               use_vt=False,
+               bg=False,
+               **kwargs):
+    '''
+    .. versionadded:: 2014.7.0
+
+    This function runs :mod:`cmd.run_all <salt.modules.cmdmod.run_all>` wrapped
+    within a chroot, with dev and proc mounted in the chroot
+
+    root
+        Path to the root of the jail to use.
+
+    cmd
+        The command to run. ex: 'ls -lart /home'
+
+    cwd
+        The current working directory to execute the command in. defaults to
+        /root
+
+    stdin
+        A string of standard input can be specified for the command to be run using
+        the ``stdin`` parameter. This can be useful in cases where sensitive
+        information must be read from standard input.:
+
+    runas
+        User to run script as.
+
+    shell
+        Shell to execute under. Defaults to the system default shell.
+
+    python_shell
+        If False, let python handle the positional arguments. Set to True
+        to use shell features, such as pipes or redirection
+
+    env
+        A list of environment variables to be set prior to execution.
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+     clean_env:
+        Attempt to clean out all other shell environment variables and set
+        only those provided in the 'env' argument to this function.
+
+    template
+        If this setting is applied then the named templating engine will be
+        used to render the downloaded file. Currently jinja, mako, and wempy
+        are supported
+
+    rstrip
+        Strip all whitespace off the end of output before it is returned.
+
+    umask
+         The umask (in octal) to use when running the command.
+
+    output_loglevel
+        Control the loglevel at which the output from the command is logged.
+        Note that the command being run will still be logged (loglevel: DEBUG)
+        regardless, unless ``quiet`` is used for this value.
+
+    timeout
+        A timeout in seconds for the executed process to return.
+
+    use_vt
+        Use VT utils (saltstack) to stream the command output more
+        interactively to the console and the logs.
+        This is experimental.
+
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.run_chroot /var/lib/lxc/container_name/rootfs 'sh /tmp/bootstrap.sh'
     '''
     __salt__['mount.mount'](
         os.path.join(root, 'dev'),
@@ -1246,11 +2623,34 @@ def run_chroot(root, cmd):
     if os.path.isfile(os.path.join(root, 'bin/bash')):
         sh_ = '/bin/bash'
 
-    cmd = 'chroot {0} {1} -c {2!r}'.format(
-        root,
-        sh_,
-        cmd)
-    res = run_all(cmd, output_loglevel='quiet')
+    if isinstance(cmd, (list, tuple)):
+        cmd = ' '.join([str(i) for i in cmd])
+    cmd = 'chroot {0} {1} -c {2}'.format(root, sh_, _cmd_quote(cmd))
+
+    run_func = __context__.pop('cmd.run_chroot.func', run_all)
+
+    ret = run_func(cmd,
+                   runas=runas,
+                   cwd=cwd,
+                   stdin=stdin,
+                   shell=shell,
+                   python_shell=python_shell,
+                   env=env,
+                   clean_env=clean_env,
+                   template=template,
+                   rstrip=rstrip,
+                   umask=umask,
+                   output_loglevel=output_loglevel,
+                   log_callback=log_callback,
+                   quiet=quiet,
+                   timeout=timeout,
+                   reset_system_locale=reset_system_locale,
+                   ignore_retcode=ignore_retcode,
+                   saltenv=saltenv,
+                   pillarenv=kwargs.get('pillarenv'),
+                   pillar=kwargs.get('pillar'),
+                   use_vt=use_vt,
+                   bg=bg)
 
     # Kill processes running in the chroot
     for i in range(6):
@@ -1268,8 +2668,7 @@ def run_chroot(root, cmd):
 
     __salt__['mount.umount'](os.path.join(root, 'proc'))
     __salt__['mount.umount'](os.path.join(root, 'dev'))
-    log.info(res)
-    return res
+    return ret
 
 
 def _is_valid_shell(shell):
@@ -1277,13 +2676,13 @@ def _is_valid_shell(shell):
     Attempts to search for valid shells on a system and
     see if a given shell is in the list
     '''
-    if salt.utils.is_windows():
+    if salt.utils.platform.is_windows():
         return True  # Don't even try this for Windows
     shells = '/etc/shells'
     available_shells = []
     if os.path.exists(shells):
         try:
-            with salt.utils.fopen(shells, 'r') as shell_fp:
+            with salt.utils.files.fopen(shells, 'r') as shell_fp:
                 lines = shell_fp.read().splitlines()
             for line in lines:
                 if line.startswith('#'):
@@ -1299,3 +2698,933 @@ def _is_valid_shell(shell):
         return True
     else:
         return False
+
+
+def shells():
+    '''
+    Lists the valid shells on this system via the /etc/shells file
+
+    .. versionadded:: 2015.5.0
+
+    CLI Example::
+
+        salt '*' cmd.shells
+    '''
+    shells_fn = '/etc/shells'
+    ret = []
+    if os.path.exists(shells_fn):
+        try:
+            with salt.utils.files.fopen(shells_fn, 'r') as shell_fp:
+                lines = shell_fp.read().splitlines()
+            for line in lines:
+                line = line.strip()
+                if line.startswith('#'):
+                    continue
+                elif not line:
+                    continue
+                else:
+                    ret.append(line)
+        except OSError:
+            log.error("File '{0}' was not found".format(shells_fn))
+    return ret
+
+
+def shell_info(shell, list_modules=False):
+    '''
+    .. versionadded:: 2016.11.0
+
+    Provides information about a shell or script languages which often use
+    ``#!``. The values returned are dependent on the shell or scripting
+    languages all return the ``installed``, ``path``, ``version``,
+    ``version_raw``
+
+    Args:
+        shell (str): Name of the shell. Support shells/script languages include
+        bash, cmd, perl, php, powershell, python, ruby and zsh
+
+        list_modules (bool): True to list modules available to the shell.
+        Currently only lists powershell modules.
+
+    Returns:
+        dict: A dictionary of information about the shell
+
+    .. code-block:: python
+
+        {'version': '<2 or 3 numeric components dot-separated>',
+         'version_raw': '<full version string>',
+         'path': '<full path to binary>',
+         'installed': <True, False or None>,
+         '<attribute>': '<attribute value>'}
+
+    .. note::
+        - ``installed`` is always returned, if ``None`` or ``False`` also
+          returns error and may also return ``stdout`` for diagnostics.
+        - ``version`` is for use in determine if a shell/script language has a
+          particular feature set, not for package management.
+        - The shell must be within the executable search path.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.shell_info bash
+        salt '*' cmd.shell_info powershell
+
+    :codeauthor: Damon Atkins <https://github.com/damon-atkins>
+    '''
+    regex_shells = {
+        'bash': [r'version (\d\S*)', 'bash', '--version'],
+        'bash-test-error': [r'versioZ ([-\w.]+)', 'bash', '--version'],  # used to test a error result
+        'bash-test-env': [r'(HOME=.*)', 'bash', '-c', 'declare'],  # used to test a error result
+        'zsh': [r'^zsh (\d\S*)', 'zsh', '--version'],
+        'tcsh': [r'^tcsh (\d\S*)', 'tcsh', '--version'],
+        'cmd': [r'Version ([\d.]+)', 'cmd.exe', '/C', 'ver'],
+        'powershell': [r'PSVersion\s+(\d\S*)', 'powershell', '-NonInteractive', '$PSVersionTable'],
+        'perl': [r'^(\d\S*)', 'perl', '-e', 'printf "%vd\n", $^V;'],
+        'python': [r'^Python (\d\S*)', 'python', '-V'],
+        'ruby': [r'^ruby (\d\S*)', 'ruby', '-v'],
+        'php': [r'^PHP (\d\S*)', 'php', '-v']
+    }
+    # Ensure ret['installed'] always as a value of True, False or None (not sure)
+    ret = {'installed': False}
+    if salt.utils.platform.is_windows() and shell == 'powershell':
+        pw_keys = __salt__['reg.list_keys'](
+            'HKEY_LOCAL_MACHINE',
+            'Software\\Microsoft\\PowerShell')
+        pw_keys.sort(key=int)
+        if len(pw_keys) == 0:
+            return {
+                'error': 'Unable to locate \'powershell\' Reason: Cannot be '
+                         'found in registry.',
+                'installed': False,
+            }
+        for reg_ver in pw_keys:
+            install_data = __salt__['reg.read_value'](
+                'HKEY_LOCAL_MACHINE',
+                'Software\\Microsoft\\PowerShell\\{0}'.format(reg_ver),
+                'Install')
+            if 'vtype' in install_data and \
+                    install_data['vtype'] == 'REG_DWORD' and \
+                    install_data['vdata'] == 1:
+                details = __salt__['reg.list_values'](
+                    'HKEY_LOCAL_MACHINE',
+                    'Software\\Microsoft\\PowerShell\\{0}\\'
+                    'PowerShellEngine'.format(reg_ver))
+
+                # reset data, want the newest version details only as powershell
+                # is backwards compatible
+                ret = {}
+
+                # if all goes well this will become True
+                ret['installed'] = None
+                ret['path'] = which('powershell.exe')
+                for attribute in details:
+                    if attribute['vname'].lower() == '(default)':
+                        continue
+                    elif attribute['vname'].lower() == 'powershellversion':
+                        ret['psversion'] = attribute['vdata']
+                        ret['version_raw'] = attribute['vdata']
+                    elif attribute['vname'].lower() == 'runtimeversion':
+                        ret['crlversion'] = attribute['vdata']
+                        if ret['crlversion'][0].lower() == 'v':
+                            ret['crlversion'] = ret['crlversion'][1::]
+                    elif attribute['vname'].lower() == 'pscompatibleversion':
+                        # reg attribute does not end in s, the powershell
+                        # attribute does
+                        ret['pscompatibleversions'] = \
+                            attribute['vdata'].replace(' ', '').split(',')
+                    else:
+                        # keys are lower case as python is case sensitive the
+                        # registry is not
+                        ret[attribute['vname'].lower()] = attribute['vdata']
+    else:
+        if shell not in regex_shells:
+            return {
+                'error': 'Salt does not know how to get the version number for '
+                         '{0}'.format(shell),
+                'installed': None
+            }
+        shell_data = regex_shells[shell]
+        pattern = shell_data.pop(0)
+        # We need to make sure HOME set, so shells work correctly
+        # salt-call will general have home set, the salt-minion service may not
+        # We need to assume ports of unix shells to windows will look after
+        # themselves in setting HOME as they do it in many different ways
+        newenv = os.environ
+        if ('HOME' not in newenv) and (not salt.utils.platform.is_windows()):
+            newenv['HOME'] = os.path.expanduser('~')
+            log.debug('HOME environment set to {0}'.format(newenv['HOME']))
+        try:
+            proc = salt.utils.timed_subprocess.TimedProc(
+                shell_data,
+                stdin=None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=10,
+                env=newenv
+                )
+        except (OSError, IOError) as exc:
+            return {
+                'error': 'Unable to run command \'{0}\' Reason: {1}'.format(' '.join(shell_data), exc),
+                'installed': False,
+            }
+        try:
+            proc.run()
+        except TimedProcTimeoutError as exc:
+            return {
+                'error': 'Unable to run command \'{0}\' Reason: Timed out.'.format(' '.join(shell_data)),
+                'installed': False,
+            }
+
+        ret['path'] = which(shell_data[0])
+        pattern_result = re.search(pattern, proc.stdout, flags=re.IGNORECASE)
+        # only set version if we find it, so code later on can deal with it
+        if pattern_result:
+            ret['version_raw'] = pattern_result.group(1)
+
+    if 'version_raw' in ret:
+        version_results = re.match(r'(\d[\d.]*)', ret['version_raw'])
+        if version_results:
+            ret['installed'] = True
+            ver_list = version_results.group(1).split('.')[:3]
+            if len(ver_list) == 1:
+                ver_list.append('0')
+            ret['version'] = '.'.join(ver_list[:3])
+    else:
+        ret['installed'] = None  # Have an unexpected result
+
+    # Get a list of the PowerShell modules which are potentially available
+    # to be imported
+    if shell == 'powershell' and ret['installed'] and list_modules:
+        ret['modules'] = salt.utils.powershell.get_modules()
+
+    if 'version' not in ret:
+        ret['error'] = 'The version regex pattern for shell {0}, could not ' \
+                       'find the version string'.format(shell)
+        ret['stdout'] = proc.stdout  # include stdout so they can see the issue
+        log.error(ret['error'])
+
+    return ret
+
+
+def powershell(cmd,
+        cwd=None,
+        stdin=None,
+        runas=None,
+        shell=DEFAULT_SHELL,
+        env=None,
+        clean_env=False,
+        template=None,
+        rstrip=True,
+        umask=None,
+        output_loglevel='debug',
+        quiet=False,
+        timeout=None,
+        reset_system_locale=True,
+        ignore_retcode=False,
+        saltenv='base',
+        use_vt=False,
+        password=None,
+        depth=None,
+        encode_cmd=False,
+        **kwargs):
+    '''
+    Execute the passed PowerShell command and return the output as a dictionary.
+
+    Other ``cmd.*`` functions (besides ``cmd.powershell_all``)
+    return the raw text output of the command. This
+    function appends ``| ConvertTo-JSON`` to the command and then parses the
+    JSON into a Python dictionary. If you want the raw textual result of your
+    PowerShell command you should use ``cmd.run`` with the ``shell=powershell``
+    option.
+
+    For example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.run '$PSVersionTable.CLRVersion' shell=powershell
+        salt '*' cmd.run 'Get-NetTCPConnection' shell=powershell
+
+    .. versionadded:: 2016.3.0
+
+    .. warning::
+
+        This passes the cmd argument directly to PowerShell
+        without any further processing! Be absolutely sure that you
+        have properly sanitized the command passed to this function
+        and do not use untrusted inputs.
+
+    Note that ``env`` represents the environment variables for the command, and
+    should be formatted as a dict, or a YAML string which resolves to a dict.
+
+    In addition to the normal ``cmd.run`` parameters, this command offers the
+    ``depth`` parameter to change the Windows default depth for the
+    ``ConvertTo-JSON`` powershell command. The Windows default is 2. If you need
+    more depth, set that here.
+
+    .. note::
+        For some commands, setting the depth to a value greater than 4 greatly
+        increases the time it takes for the command to return and in many cases
+        returns useless data.
+
+    :param str cmd: The powershell command to run.
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    :param bool reset_system_locale: Resets the system locale
+
+    :param bool ignore_retcode: Ignore the return code
+
+    :param str saltenv: The salt environment to use. Default is 'base'
+
+    :param int depth: The number of levels of contained objects to be included.
+        Default is 2. Values greater than 4 seem to greatly increase the time
+        it takes for the command to complete for some commands. eg: ``dir``
+
+        .. versionadded:: 2016.3.4
+
+    :param bool encode_cmd: Encode the command before executing. Use in cases
+      where characters may be dropped or incorrectly converted when executed.
+      Default is False.
+
+    :returns:
+        :dict: A dictionary of data returned by the powershell command.
+
+    CLI Example:
+
+    .. code-block:: powershell
+
+        salt '*' cmd.powershell "$PSVersionTable.CLRVersion"
+    '''
+    if 'python_shell' in kwargs:
+        python_shell = kwargs.pop('python_shell')
+    else:
+        python_shell = True
+
+    # Append PowerShell Object formatting
+    cmd += ' | ConvertTo-JSON'
+    if depth is not None:
+        cmd += ' -Depth {0}'.format(depth)
+
+    if encode_cmd:
+        # Convert the cmd to UTF-16LE without a BOM and base64 encode.
+        # Just base64 encoding UTF-8 or including a BOM is not valid.
+        log.debug('Encoding PowerShell command \'{0}\''.format(cmd))
+        cmd_utf16 = cmd.decode('utf-8').encode('utf-16le')
+        cmd = base64.standard_b64encode(cmd_utf16)
+        encoded_cmd = True
+    else:
+        encoded_cmd = False
+
+    # Retrieve the response, while overriding shell with 'powershell'
+    response = run(cmd,
+                   cwd=cwd,
+                   stdin=stdin,
+                   runas=runas,
+                   shell='powershell',
+                   env=env,
+                   clean_env=clean_env,
+                   template=template,
+                   rstrip=rstrip,
+                   umask=umask,
+                   output_loglevel=output_loglevel,
+                   quiet=quiet,
+                   timeout=timeout,
+                   reset_system_locale=reset_system_locale,
+                   ignore_retcode=ignore_retcode,
+                   saltenv=saltenv,
+                   use_vt=use_vt,
+                   python_shell=python_shell,
+                   password=password,
+                   encoded_cmd=encoded_cmd,
+                   **kwargs)
+
+    try:
+        return json.loads(response)
+    except Exception:
+        log.error("Error converting PowerShell JSON return", exc_info=True)
+        return {}
+
+
+def powershell_all(cmd,
+                   cwd=None,
+                   stdin=None,
+                   runas=None,
+                   shell=DEFAULT_SHELL,
+                   env=None,
+                   clean_env=False,
+                   template=None,
+                   rstrip=True,
+                   umask=None,
+                   output_loglevel='debug',
+                   quiet=False,
+                   timeout=None,
+                   reset_system_locale=True,
+                   ignore_retcode=False,
+                   saltenv='base',
+                   use_vt=False,
+                   password=None,
+                   depth=None,
+                   encode_cmd=False,
+                   force_list=False,
+                   **kwargs):
+    '''
+    Execute the passed PowerShell command and return a dictionary with a result field
+    representing the output of the command, as well as other fields
+    showing us what the PowerShell invocation wrote to ``stderr``, the process id,
+    and the exit code of the invocation.
+
+    This function appends ``| ConvertTo-JSON`` to the command before actually invoking powershell.
+
+    An unquoted empty string is not valid JSON, but it's very normal for the Powershell
+    output to be exactly that. Therefore, we do not attempt to
+    parse empty Powershell output (which would
+    result in an exception). Instead we treat this as a special case and one of two things
+    will happen:
+       * If the value of the ``force_list`` paramater
+         is ``True`` then the ``result`` field of the return dictionary will be an empty list.
+       * If the value of the ``force_list`` paramater is ``False``, then the return dictionary
+         **will not have a result key added to it**. We aren't setting ``result`` to ``None`` in this
+         case, because ``None`` is the Python representation of "null" in JSON. (We likewise can't use
+         ``False`` for the equivalent reason.)
+
+    If Powershell's output is not an empty string and Python cannot parse its content,
+    then a ``CommandExecutionError`` exception will be raised.
+
+    If Powershell's output is not an empty string, Python is able to parse its content,
+    and the type of the resulting Python object is other than ``list`` then one of two things
+    will happen:
+        * If the value of the ``force_list`` paramater is ``True``, then the ``result`` field
+          will be a singleton list
+          with the Python object as its sole member.
+        * If the value of the ``force_list`` paramater is ``False``, then the value of
+          ``result`` will be
+          the unmodified Python object.
+
+    If Powershell's output is not an empty string, Python is able to parse its content,
+    and the type of the resulting Python object is ``list``, then the value of ``result``
+    will be the unmodified Python object. The ``force_list`` paramater has no effect in this case.
+
+    .. Note::
+         An example of why the ``force_list`` paramater is useful is as follows: The
+         Powershell command
+         ``dir x | Convert-ToJson`` results in
+
+             * no output when x is an empty directory.
+             * a dictionary object when x contains just one item.
+             * a list of dictionary objects when x contains multiple items.
+
+         By setting ``force_list`` to ``True`` we will always end up with a list of dictionary items,
+         representing files,
+         no matter how many files x contains.
+         Conversely, if ``force_list`` is ``False``, we will end up with no ``result`` key in our
+         return dictionary
+         when x is an
+         empty directory, and a dictionary object when x contains just one file.
+
+    If you want a similar function but with a raw
+    textual result instead of a Python dictionary,
+    you should use ``cmd.run_all`` in combination with ``shell=powershell``.
+
+    The remaining fields in the return dictionary are described in more detail
+    in the ``Returns`` section.
+
+    Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.run_all '$PSVersionTable.CLRVersion' shell=powershell
+        salt '*' cmd.run_all 'Get-NetTCPConnection' shell=powershell
+
+    .. versionadded:: Oxygen
+
+    .. warning::
+
+        This passes the cmd argument directly to PowerShell
+        without any further processing! Be absolutely sure that you
+        have properly sanitized the command passed to this function
+        and do not use untrusted inputs.
+
+    Note that ``env`` represents the environment variables for the command, and
+    should be formatted as a dict, or a YAML string which resolves to a dict.
+
+    In addition to the normal ``cmd.run`` parameters, this command offers the
+    ``depth`` parameter to change the Windows default depth for the
+    ``ConvertTo-JSON`` powershell command. The Windows default is 2. If you need
+    more depth, set that here.
+
+    .. note::
+        For some commands, setting the depth to a value greater than 4 greatly
+        increases the time it takes for the command to return and in many cases
+        returns useless data.
+
+    :param str cmd: The powershell command to run.
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str stdin: A string of standard input can be specified for the
+      command to be run using the ``stdin`` parameter. This can be useful in cases
+      where sensitive information must be read from standard input.:
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param bool rstrip: Strip all whitespace off the end of output before it is
+      returned.
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    :param bool use_vt: Use VT utils (saltstack) to stream the command output
+      more interactively to the console and the logs. This is experimental.
+
+    :param bool reset_system_locale: Resets the system locale
+
+    :param bool ignore_retcode: Ignore the return code
+
+    :param str saltenv: The salt environment to use. Default is 'base'
+
+    :param int depth: The number of levels of contained objects to be included.
+        Default is 2. Values greater than 4 seem to greatly increase the time
+        it takes for the command to complete for some commands. eg: ``dir``
+
+    :param bool encode_cmd: Encode the command before executing. Use in cases
+      where characters may be dropped or incorrectly converted when executed.
+      Default is False.
+
+    :param bool force_list: The purpose of this paramater is described in the preamble
+      of this function's documentation. Default value is False.
+
+    :return: A dictionary with the following entries:
+
+        result
+            For a complete description of this field, please refer to this
+            function's preamble. **This key will not be added to the dictionary
+            when force_list is False and Powershell's output
+            is the empty string.**
+        stderr
+            What the PowerShell invocation wrote to ``stderr``.
+        pid
+            The process id of the PowerShell invocation
+        retcode
+            This is the exit code of the invocation of PowerShell.
+            If the final execution status (in PowerShell) of our command
+            (with ``| ConvertTo-JSON`` appended) is ``False`` this should be non-0.
+            Likewise if PowerShell exited with ``$LASTEXITCODE`` set to some
+            non-0 value, then ``retcode`` will end up with this value.
+
+    :rtype: dict
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.powershell_all "$PSVersionTable.CLRVersion"
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.powershell_all "dir mydirectory" force_list=True
+    '''
+    if 'python_shell' in kwargs:
+        python_shell = kwargs.pop('python_shell')
+    else:
+        python_shell = True
+
+    # Append PowerShell Object formatting
+    cmd += ' | ConvertTo-JSON'
+    if depth is not None:
+        cmd += ' -Depth {0}'.format(depth)
+
+    if encode_cmd:
+        # Convert the cmd to UTF-16LE without a BOM and base64 encode.
+        # Just base64 encoding UTF-8 or including a BOM is not valid.
+        log.debug('Encoding PowerShell command \'{0}\''.format(cmd))
+        cmd_utf16 = cmd.decode('utf-8').encode('utf-16le')
+        cmd = base64.standard_b64encode(cmd_utf16)
+        encoded_cmd = True
+    else:
+        encoded_cmd = False
+
+    # Retrieve the response, while overriding shell with 'powershell'
+    response = run_all(cmd,
+                   cwd=cwd,
+                   stdin=stdin,
+                   runas=runas,
+                   shell='powershell',
+                   env=env,
+                   clean_env=clean_env,
+                   template=template,
+                   rstrip=rstrip,
+                   umask=umask,
+                   output_loglevel=output_loglevel,
+                   quiet=quiet,
+                   timeout=timeout,
+                   reset_system_locale=reset_system_locale,
+                   ignore_retcode=ignore_retcode,
+                   saltenv=saltenv,
+                   use_vt=use_vt,
+                   python_shell=python_shell,
+                   password=password,
+                   encoded_cmd=encoded_cmd,
+                   **kwargs)
+    stdoutput = response['stdout']
+
+    # if stdoutput is the empty string and force_list is True we return an empty list
+    # Otherwise we return response with no result key
+    if not stdoutput:
+        response.pop('stdout')
+        if force_list:
+            response['result'] = []
+        return response
+
+    # If we fail to parse stdoutput we will raise an exception
+    try:
+        result = json.loads(stdoutput)
+    except Exception:
+        err_msg = "cmd.powershell_all " + \
+                  "cannot parse the Powershell output."
+        response["cmd"] = cmd
+        raise CommandExecutionError(
+            message=err_msg,
+            info=response
+        )
+
+    response.pop("stdout")
+
+    if type(result) is not list:
+        if force_list:
+            response['result'] = [result]
+        else:
+            response['result'] = result
+    else:
+        # result type is list so the force_list param has no effect
+        response['result'] = result
+    return response
+
+
+def run_bg(cmd,
+        cwd=None,
+        runas=None,
+        shell=DEFAULT_SHELL,
+        python_shell=None,
+        env=None,
+        clean_env=False,
+        template=None,
+        umask=None,
+        timeout=None,
+        output_loglevel='debug',
+        log_callback=None,
+        reset_system_locale=True,
+        ignore_retcode=False,
+        saltenv='base',
+        password=None,
+        **kwargs):
+    r'''
+    .. versionadded: 2016.3.0
+
+    Execute the passed command in the background and return it's PID
+
+    Note that ``env`` represents the environment variables for the command, and
+    should be formatted as a dict, or a YAML string which resolves to a dict.
+
+    :param str cmd: The command to run. ex: 'ls -lart /home'
+
+    :param str cwd: The current working directory to execute the command in.
+      Defaults to the home directory of the user specified by ``runas``.
+
+    :param str output_loglevel: Control the loglevel at which the output from
+      the command is logged. Note that the command being run will still be logged
+      (loglevel: DEBUG) regardless, unless ``quiet`` is used for this value.
+
+    :param str runas: User to run command as. If running on a Windows minion you
+      must also pass a password. The target user account must be in the
+      Administrators group.
+
+    :param str password: Windows only. Required when specifying ``runas``. This
+      parameter will be ignored on non-Windows platforms.
+
+      .. versionadded:: 2016.3.0
+
+    :param str shell: Shell to execute under. Defaults to the system default
+      shell.
+
+    :param bool python_shell: If False, let python handle the positional
+      arguments. Set to True to use shell features, such as pipes or redirection
+
+    :param list env: A list of environment variables to be set prior to
+      execution.
+
+        Example:
+
+        .. code-block:: yaml
+
+            salt://scripts/foo.sh:
+              cmd.script:
+                - env:
+                  - BATCH: 'yes'
+
+        .. warning::
+
+            The above illustrates a common PyYAML pitfall, that **yes**,
+            **no**, **on**, **off**, **true**, and **false** are all loaded as
+            boolean ``True`` and ``False`` values, and must be enclosed in
+            quotes to be used as strings. More info on this (and other) PyYAML
+            idiosyncrasies can be found :ref:`here <yaml-idiosyncrasies>`.
+
+        Variables as values are not evaluated. So $PATH in the following
+        example is a literal '$PATH':
+
+        .. code-block:: yaml
+
+            salt://scripts/bar.sh:
+              cmd.script:
+                - env: "PATH=/some/path:$PATH"
+
+        One can still use the existing $PATH by using a bit of Jinja:
+
+        .. code-block:: jinja
+
+            {% set current_path = salt['environ.get']('PATH', '/bin:/usr/bin') %}
+
+            mycommand:
+              cmd.run:
+                - name: ls -l /
+                - env:
+                  - PATH: {{ [current_path, '/my/special/bin']|join(':') }}
+
+    :param bool clean_env: Attempt to clean out all other shell environment
+      variables and set only those provided in the 'env' argument to this
+      function.
+
+    :param str template: If this setting is applied then the named templating
+      engine will be used to render the downloaded file. Currently jinja, mako,
+      and wempy are supported
+
+    :param str umask: The umask (in octal) to use when running the command.
+
+    :param int timeout: A timeout in seconds for the executed process to return.
+
+    .. warning::
+
+        This function does not process commands through a shell
+        unless the python_shell flag is set to True. This means that any
+        shell-specific functionality such as 'echo' or the use of pipes,
+        redirection or &&, should either be migrated to cmd.shell or
+        have the python_shell=True flag set here.
+
+        The use of python_shell=True means that the shell will accept _any_ input
+        including potentially malicious commands such as 'good_command;rm -rf /'.
+        Be absolutely certain that you have sanitized your input prior to using
+        python_shell=True
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.run_bg "fstrim-all"
+
+    The template arg can be set to 'jinja' or another supported template
+    engine to render the command arguments before execution.
+    For example:
+
+    .. code-block:: bash
+
+        salt '*' cmd.run_bg template=jinja "ls -l /tmp/{{grains.id}} | awk '/foo/{print \\$2}'"
+
+    Specify an alternate shell with the shell parameter:
+
+    .. code-block:: bash
+
+        salt '*' cmd.run_bg "Get-ChildItem C:\\ " shell='powershell'
+
+    If an equal sign (``=``) appears in an argument to a Salt command it is
+    interpreted as a keyword argument in the format ``key=val``. That
+    processing can be bypassed in order to pass an equal sign through to the
+    remote shell command by manually specifying the kwarg:
+
+    .. code-block:: bash
+
+        salt '*' cmd.run_bg cmd='ls -lR / | sed -e s/=/:/g > /tmp/dontwait'
+    '''
+
+    python_shell = _python_shell_default(python_shell,
+                                         kwargs.get('__pub_jid', ''))
+    res = _run(cmd,
+               stdin=None,
+               stderr=None,
+               stdout=None,
+               output_loglevel=output_loglevel,
+               use_vt=None,
+               bg=True,
+               with_communicate=False,
+               rstrip=False,
+               runas=runas,
+               shell=shell,
+               python_shell=python_shell,
+               cwd=cwd,
+               env=env,
+               clean_env=clean_env,
+               template=template,
+               umask=umask,
+               log_callback=log_callback,
+               timeout=timeout,
+               reset_system_locale=reset_system_locale,
+               ignore_retcode=ignore_retcode,
+               saltenv=saltenv,
+               password=password,
+               **kwargs
+               )
+
+    return {
+        'pid': res['pid']
+    }

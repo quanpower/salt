@@ -2,13 +2,15 @@
 '''
 Support for poudriere
 '''
+from __future__ import absolute_import
 
 # Import python libs
 import os
 import logging
 
 # Import salt libs
-import salt.utils
+import salt.utils.files
+import salt.utils.path
 
 log = logging.getLogger(__name__)
 
@@ -17,10 +19,10 @@ def __virtual__():
     '''
     Module load on freebsd only and if poudriere installed
     '''
-    if __grains__['os'] == 'FreeBSD' and salt.utils.which('poudriere'):
+    if __grains__['os'] == 'FreeBSD' and salt.utils.path.which('poudriere'):
         return 'poudriere'
     else:
-        return False
+        return (False, 'The poudriere execution module failed to load: only available on FreeBSD with the poudriere binary in the path.')
 
 
 def _config_file():
@@ -87,10 +89,7 @@ def make_pkgng_aware(jname):
                     cdir)
 
     # Added args to file
-    cmd = 'echo "WITH_PKGNG=yes" > {0}-make.conf'.format(
-            os.path.join(cdir, jname))
-
-    __salt__['cmd.run'](cmd)
+    __salt__['file.write']('{0}-make.conf'.format(os.path.join(cdir, jname)), 'WITH_PKGNG=yes')
 
     if os.path.isfile(os.path.join(cdir, jname) + '-make.conf'):
         ret['changes'] = 'Created {0}'.format(
@@ -117,7 +116,7 @@ def parse_config(config_file=None):
         config_file = _config_file()
     ret = {}
     if _check_config_exists(config_file):
-        with salt.utils.fopen(config_file) as ifile:
+        with salt.utils.files.fopen(config_file) as ifile:
             for line in ifile:
                 key, val = line.split('=')
                 ret[key] = val
@@ -252,8 +251,7 @@ def delete_jail(name):
         except (IOError, OSError):
             return ('Deleted jail "{0}" but was unable to remove jail make '
                     'file').format(name)
-        cmd = 'rm -f {0}'.format(make_file)
-        __salt__['cmd.run'](cmd)
+        __salt__['file.remove'](make_file)
 
     return 'Deleted jail {0}'.format(name)
 

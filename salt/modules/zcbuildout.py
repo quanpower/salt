@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 '''
 Management of zc.buildout
-=========================
 
-.. versionadded:: 2014.1.0 (Hydrogen)
+.. versionadded:: 2014.1.0
 
 .. _`minitage's buildout maker`: https://github.com/minitage/minitage/blob/master/src/minitage/core/makers/buildout.py
 
@@ -24,28 +23,26 @@ You have those following methods:
 * buildout
 '''
 
-# Define the module's virtual name
-__virtualname__ = 'buildout'
-
-
-def __virtual__():
-    '''
-    Only load if buildout libs are present
-    '''
-    if True:
-        return __virtualname__
-    return False
-
 # Import python libs
+from __future__ import absolute_import
+
 import os
 import re
+import logging
 import sys
 import traceback
-import urllib2
+import copy
+
+# Import 3rd-party libs
+# pylint: disable=import-error,no-name-in-module,redefined-builtin
+from salt.ext import six
+from salt.ext.six.moves import range
+from salt.ext.six.moves.urllib.request import urlopen as _urlopen
+# pylint: enable=import-error,no-name-in-module,redefined-builtin
 
 # Import salt libs
+import salt.utils.files
 from salt.exceptions import CommandExecutionError
-from salt._compat import string_types
 
 
 INVALID_RESPONSE = 'We did not get any expectable answer from buildout'
@@ -67,12 +64,28 @@ _URL_VERSIONS = {
     2: u'http://downloads.buildout.org/2/bootstrap.py',
 }
 DEFAULT_VER = 2
+_logger = logging.getLogger(__name__)
+
+# Define the module's virtual name
+__virtualname__ = 'buildout'
 
 
-def _salt_callback(func):
+def __virtual__():
+    '''
+    Only load if buildout libs are present
+    '''
+    return __virtualname__
+
+
+def _salt_callback(func, **kwargs):
     LOG.clear()
 
     def _call_callback(*a, **kw):
+        # cleanup the module kwargs before calling it from the
+        # decorator
+        kw = copy.deepcopy(kw)
+        for k in [ar for ar in kw if '__pub' in ar]:
+            kw.pop(k, None)
         st = BASE_STATUS.copy()
         directory = kw.get('directory', '.')
         onlyif = kw.get('onlyif', None)
@@ -111,7 +124,7 @@ def _salt_callback(func):
         LOG.clear()
         # before returning, trying to compact the log output
         for k in ['comment', 'out', 'outlog']:
-            if status[k] and isinstance(status[k], string_types):
+            if status[k] and isinstance(status[k], six.string_types):
                 status[k] = '\n'.join([
                     log
                     for log in status[k].split('\n')
@@ -129,7 +142,7 @@ class _Logger(object):
         self._by_level = {}
 
     def _log(self, level, msg):
-        if not isinstance(msg, unicode):
+        if not isinstance(msg, six.text_type):
             msg = msg.decode('utf-8')
         if level not in self._by_level:
             self._by_level[level] = []
@@ -172,7 +185,7 @@ LOG = _Logger()
 
 
 def _encode_string(string):
-    if isinstance(string, unicode):
+    if isinstance(string, six.text_type):
         string = string.encode('utf-8')
     return string
 
@@ -204,7 +217,7 @@ def _set_status(m,
     m['logs_by_level'] = LOG.by_level.copy()
     outlog, outlog_by_level = '', ''
     m['comment'] = comment
-    if out and isinstance(out, string_types):
+    if out and isinstance(out, six.string_types):
         outlog += HR
         outlog += 'OUTPUT:\n'
         outlog += '{0}\n'.format(_encode_string(out))
@@ -252,7 +265,9 @@ def _Popen(command,
            directory='.',
            runas=None,
            env=(),
-           exitcode=0):
+           exitcode=0,
+           use_vt=False,
+           loglevel=None):
     '''
     Run a command.
 
@@ -272,13 +287,20 @@ def _Popen(command,
         fails if cmd does not return this exit code
         (set to None to disable check)
 
+    use_vt
+        Use the new salt VT to stream output [experimental]
+
     '''
     ret = None
     directory = os.path.abspath(directory)
     if isinstance(command, list):
         command = ' '.join(command)
     LOG.debug(u'Running {0}'.format(command))
-    ret = __salt__['cmd.run_all'](command, cwd=directory, runas=runas, env=env)
+    if not loglevel:
+        loglevel = 'debug'
+    ret = __salt__['cmd.run_all'](
+        command, cwd=directory, output_loglevel=loglevel,
+        runas=runas, env=env, use_vt=use_vt, python_shell=False)
     out = ret['stdout'] + '\n\n' + ret['stderr']
     if (exitcode is not None) and (ret['retcode'] != exitcode):
         raise _BuildoutError(out)
@@ -369,11 +391,10 @@ def _get_bootstrap_content(directory='.'):
     Get the current bootstrap.py script content
     '''
     try:
-        fic = open(
-            os.path.join(
-                os.path.abspath(directory), 'bootstrap.py'))
-        oldcontent = fic.read()
-        fic.close()
+        with salt.utils.files.fopen(os.path.join(
+                                os.path.abspath(directory),
+                                'bootstrap.py')) as fic:
+            oldcontent = fic.read()
     except (OSError, IOError):
         oldcontent = ''
     return oldcontent
@@ -395,16 +416,15 @@ def _get_buildout_ver(directory='.'):
     try:
         files = _find_cfgs(directory)
         for f in files:
-            fic = open(f)
-            buildout1re = re.compile(r'^zc\.buildout\s*=\s*1', RE_F)
-            dfic = fic.read()
-            if (
-                    ('buildout.dumppick' in dfic)
-                    or
-                    (buildout1re.search(dfic))
-            ):
-                buildoutver = 1
-            fic.close()
+            with salt.utils.files.fopen(f) as fic:
+                buildout1re = re.compile(r'^zc\.buildout\s*=\s*1', RE_F)
+                dfic = fic.read()
+                if (
+                        ('buildout.dumppick' in dfic)
+                        or
+                        (buildout1re.search(dfic))
+                ):
+                    buildoutver = 1
         bcontent = _get_bootstrap_content(directory)
         if (
             '--download-base' in bcontent
@@ -498,12 +518,13 @@ def upgrade_bootstrap(directory='.',
                 if not os.path.isdir(dbuild):
                     os.makedirs(dbuild)
                 # only try to download once per buildout checkout
-                open(os.path.join(
-                    dbuild,
-                    '{0}.updated_bootstrap'.format(buildout_ver)))
+                with salt.utils.files.fopen(os.path.join(
+                        dbuild,
+                        '{0}.updated_bootstrap'.format(buildout_ver))):
+                    pass
             except (OSError, IOError):
                 LOG.info('Bootstrap updated from repository')
-                data = urllib2.urlopen(booturl).read()
+                data = _urlopen(booturl).read()
                 updated = True
                 dled = True
         if 'socket.setdefaulttimeout' not in data:
@@ -513,20 +534,17 @@ def upgrade_bootstrap(directory='.',
             data = '\n'.join(ldata)
         if updated:
             comment = 'Bootstrap updated'
-            fic = open(b_py, 'w')
-            fic.write(data)
-            fic.close()
+            with salt.utils.files.fopen(b_py, 'w') as fic:
+                fic.write(data)
         if dled:
-            afic = open(os.path.join(
-                dbuild, '{0}.updated_bootstrap'.format(buildout_ver)
-            ), 'w')
-            afic.write('foo')
-            afic.close()
+            with salt.utils.files.fopen(os.path.join(dbuild,
+                                               '{0}.updated_bootstrap'.format(
+                                                   buildout_ver)), 'w') as afic:
+                afic.write('foo')
     except (OSError, IOError):
         if oldcontent:
-            fic = open(b_py, 'w')
-            fic.write(oldcontent)
-            fic.close()
+            with salt.utils.files.fopen(b_py, 'w') as fic:
+                fic.write(oldcontent)
 
     return {'comment': comment}
 
@@ -543,7 +561,9 @@ def bootstrap(directory='.',
               buildout_ver=None,
               test_release=False,
               offline=False,
-              new_st=None):
+              new_st=None,
+              use_vt=False,
+              loglevel=None):
     '''
     Run the buildout bootstrap dance (python bootstrap.py).
 
@@ -582,6 +602,9 @@ def bootstrap(directory='.',
 
     unless
         Do not execute cmd if statement on the host return 0
+
+    use_vt
+        Use the new salt VT to stream output [experimental]
 
     CLI Example:
 
@@ -698,11 +721,11 @@ def bootstrap(directory='.',
         distribute = False
     if new_st:
         distribute = False
-        LOG.warning(u'Forcing to use setuptools as we have setuptools >= 0.7')
+        LOG.warning('Forcing to use setuptools as we have setuptools >= 0.7')
     if distribute:
         new_st = False
         if buildout_ver == 1:
-            LOG.warning(u'Using distribute !')
+            LOG.warning('Using distribute !')
             bootstrap_args += ' --distribute'
     if not os.path.isdir(dbuild):
         os.makedirs(dbuild)
@@ -711,18 +734,29 @@ def bootstrap(directory='.',
                       buildout_ver=buildout_ver)
     # be sure which buildout bootstrap we have
     b_py = os.path.join(directory, 'bootstrap.py')
-    fic = open(b_py)
-    content = fic.read()
-    fic.close()
+    with salt.utils.files.fopen(b_py) as fic:
+        content = fic.read()
     if (
-        (False != test_release)
+        (test_release is not False)
         and ' --accept-buildout-test-releases' in content
     ):
         bootstrap_args += ' --accept-buildout-test-releases'
     if config and '"-c"' in content:
         bootstrap_args += ' -c {0}'.format(config)
+    # be sure that the bootstrap belongs to the running user
+    try:
+        if runas:
+            uid = __salt__['user.info'](runas)['uid']
+            gid = __salt__['user.info'](runas)['gid']
+            os.chown('bootstrap.py', uid, gid)
+    except (IOError, OSError) as exc:
+        # don't block here, try to execute it if can pass
+        _logger.error('BUILDOUT bootstrap permissions error:'
+                      ' {0}'.format(exc),
+                  exc_info=_logger.isEnabledFor(logging.DEBUG))
     cmd = '{0} bootstrap.py {1}'.format(python, bootstrap_args)
-    ret = _Popen(cmd, directory=directory, runas=runas, env=env)
+    ret = _Popen(cmd, directory=directory, runas=runas, loglevel=loglevel,
+                 env=env, use_vt=use_vt)
     output = ret['output']
     return {'comment': cmd, 'out': output}
 
@@ -738,7 +772,9 @@ def run_buildout(directory='.',
                  runas=None,
                  env=(),
                  verbose=False,
-                 debug=False):
+                 debug=False,
+                 use_vt=False,
+                 loglevel=None):
     '''
     Run a buildout in a directory.
 
@@ -771,6 +807,9 @@ def run_buildout(directory='.',
 
     verbose
         run buildout in verbose mode (-vvvvv)
+
+    use_vt
+        Use the new salt VT to stream output [experimental]
 
     CLI Example:
 
@@ -809,7 +848,9 @@ def run_buildout(directory='.',
                     cmd, directory=directory,
                     runas=runas,
                     env=env,
-                    output=True)
+                    output=True,
+                    loglevel=loglevel,
+                    use_vt=use_vt)
             )
     else:
         LOG.info(u'Installing all buildout parts')
@@ -817,7 +858,9 @@ def run_buildout(directory='.',
             bcmd, config, ' '.join(argv))
         cmds.append(cmd)
         outputs.append(
-            _Popen(cmd, directory=directory, runas=runas, env=env, output=True)
+            _Popen(
+                cmd, directory=directory, runas=runas, loglevel=loglevel,
+                env=env, output=True, use_vt=use_vt)
         )
 
     return {'comment': '\n'.join(cmds),
@@ -888,7 +931,9 @@ def buildout(directory='.',
              debug=False,
              verbose=False,
              onlyif=None,
-             unless=None):
+             unless=None,
+             use_vt=False,
+             loglevel=None):
     '''
     Run buildout in a directory.
 
@@ -939,6 +984,8 @@ def buildout(directory='.',
     verbose
         run buildout in verbose mode (-vvvvv)
 
+    use_vt
+        Use the new salt VT to stream output [experimental]
 
     CLI Example:
 
@@ -956,7 +1003,9 @@ def buildout(directory='.',
                          env=env,
                          runas=runas,
                          distribute=distribute,
-                         python=python)
+                         python=python,
+                         use_vt=use_vt,
+                         loglevel=loglevel)
     buildout_ret = run_buildout(directory=directory,
                                 config=config,
                                 parts=parts,
@@ -965,7 +1014,9 @@ def buildout(directory='.',
                                 runas=runas,
                                 env=env,
                                 verbose=verbose,
-                                debug=debug)
+                                debug=debug,
+                                use_vt=use_vt,
+                                loglevel=loglevel)
     # signal the decorator or our return
     return _merge_statuses([boot_ret, buildout_ret])
 
@@ -978,18 +1029,18 @@ def _check_onlyif_unless(onlyif, unless, directory, runas=None, env=()):
         status['status'] = False
         retcode = __salt__['cmd.retcode']
         if onlyif is not None:
-            if not isinstance(onlyif, string_types):
+            if not isinstance(onlyif, six.string_types):
                 if not onlyif:
                     _valid(status, 'onlyif execution failed')
-            elif isinstance(onlyif, string_types):
+            elif isinstance(onlyif, six.string_types):
                 if retcode(onlyif, cwd=directory, runas=runas, env=env) != 0:
                     _valid(status, 'onlyif execution failed')
         if unless is not None:
-            if not isinstance(unless, string_types):
+            if not isinstance(unless, six.string_types):
                 if unless:
                     _valid(status, 'unless execution succeeded')
-            elif isinstance(unless, string_types):
-                if retcode(unless, cwd=directory, runas=runas, env=env) == 0:
+            elif isinstance(unless, six.string_types):
+                if retcode(unless, cwd=directory, runas=runas, env=env, python_shell=False) == 0:
                     _valid(status, 'unless execution succeeded')
     if status['status']:
         ret = status

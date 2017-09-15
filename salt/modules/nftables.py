@@ -2,13 +2,15 @@
 '''
 Support for nftables
 '''
+from __future__ import absolute_import
 
 # Import python libs
 import logging
 import re
 
 # Import salt libs
-import salt.utils
+import salt.utils.files
+import salt.utils.path
 from salt.state import STATE_INTERNAL_KEYWORDS as _STATE_INTERNAL_KEYWORDS
 from salt.exceptions import (
     CommandExecutionError
@@ -24,8 +26,10 @@ _NFTABLES_FAMILIES = {
         'ip': 'ip',
         'ipv6': 'ip6',
         'ip6': 'ip6',
+        'inet': 'inet',
         'arp': 'arp',
-        'bridge': 'bridge'
+        'bridge': 'bridge',
+        'netdev': 'netdev'
         }
 
 
@@ -33,9 +37,9 @@ def __virtual__():
     '''
     Only load the module if nftables is installed
     '''
-    if salt.utils.which('nft'):
+    if salt.utils.path.which('nft'):
         return 'nftables'
-    return False
+    return (False, 'The nftables execution module failed to load: nftables is not installed.')
 
 
 def _nftables_cmd():
@@ -257,7 +261,8 @@ def get_saved_rules(conf_file=None, family='ipv4'):
     if _conf() and not conf_file:
         conf_file = _conf()
 
-    lines = salt.utils.fopen(conf_file).readlines()
+    with salt.utils.files.fopen(conf_file) as fp_:
+        lines = fp_.readlines()
     rules = []
     for line in lines:
         tmpline = line.strip()
@@ -286,7 +291,7 @@ def get_rules(family='ipv4'):
     rules = []
     cmd = '{0} --numeric --numeric --numeric list tables {1}'.\
         format(_nftables_cmd(), nft_family)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
     if not out:
         return rules
 
@@ -295,7 +300,7 @@ def get_rules(family='ipv4'):
         table_name = table.split(' ')[1]
         cmd = '{0} --numeric --numeric --numeric list table {1} {2}'.format(_nftables_cmd(),
                 nft_family, table_name)
-        out = __salt__['cmd.run'](cmd)
+        out = __salt__['cmd.run'](cmd, python_shell=False)
         rules.append(out)
     return rules
 
@@ -323,7 +328,7 @@ def save(filename=None, family='ipv4'):
     rules = rules + '\n'
 
     try:
-        with salt.utils.fopen(filename, 'w+') as _fh:
+        with salt.utils.files.fopen(filename, 'w+') as _fh:
             # Write out any changes
             _fh.writelines(rules)
     except (IOError, OSError) as exc:
@@ -364,7 +369,7 @@ def get_rule_handle(table='filter', chain=None, rule=None, family='ipv4'):
                 format(table, family)
 
     if not check_chain(table, chain, family=family):
-        return 'Error: chain {0} in table {1} in family {1} does not exist'.\
+        return 'Error: chain {0} in table {1} in family {2} does not exist'.\
                 format(chain, table, family)
 
     if not check(table, chain, rule, family=family):
@@ -374,15 +379,15 @@ def get_rule_handle(table='filter', chain=None, rule=None, family='ipv4'):
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} --numeric --numeric --numeric --handle list chain {1} {2} {3}'.\
         format(_nftables_cmd(), nft_family, table, chain)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
     rules = re.split('\n+', out)
 
     pat = re.compile(r'{0} # handle (?P<handle>\d+)'.format(rule))
-    for rule in rules:
-        match = pat.search(rule)
+    for r in rules:
+        match = pat.search(r)
         if match:
-            handle = match.group('handle')
-    return handle
+            return match.group('handle')
+    return 'Error: could not find rule {0}'.format(rule)
 
 
 def check(table='filter', chain=None, rule=None, family='ipv4'):
@@ -416,14 +421,14 @@ def check(table='filter', chain=None, rule=None, family='ipv4'):
                 format(table, family)
 
     if not check_chain(table, chain, family=family):
-        return 'Error: chain {0} in table {1} in family {1} does not exist'.\
+        return 'Error: chain {0} in table {1} in family {2} does not exist'.\
                 format(chain, table, family)
 
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} --handle --numeric --numeric --numeric list chain {1} {2} {3}'.\
             format(_nftables_cmd(), nft_family, table, chain)
     search_rule = '{0} #'.format(rule)
-    out = __salt__['cmd.run'](cmd).find(search_rule)
+    out = __salt__['cmd.run'](cmd, python_shell=False).find(search_rule)
 
     if out != -1:
         out = ''
@@ -437,7 +442,7 @@ def check(table='filter', chain=None, rule=None, family='ipv4'):
 
 def check_chain(table='filter', chain=None, family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Check for the existence of a chain in the table
 
@@ -456,7 +461,7 @@ def check_chain(table='filter', chain=None, family='ipv4'):
 
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} list table {1} {2}' . format(_nftables_cmd(), nft_family, table)
-    out = __salt__['cmd.run'](cmd).find('chain {0} {{'.format(chain))
+    out = __salt__['cmd.run'](cmd, python_shell=False).find('chain {0} {{'.format(chain))
 
     if out != -1:
         out = ''
@@ -471,13 +476,17 @@ def check_chain(table='filter', chain=None, family='ipv4'):
 def check_table(table=None, family='ipv4'):
     '''
     Check for the existence of a table
+
+    CLI Example::
+
+        salt '*' nftables.check_table nat
     '''
     if not table:
         return 'Error: table needs to be specified'
 
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} list tables {1}' . format(_nftables_cmd(), nft_family)
-    out = __salt__['cmd.run'](cmd).find('table {0}'.format(table))
+    out = __salt__['cmd.run'](cmd, python_shell=False).find('table {0} {1}'.format(nft_family, table))
 
     if out != -1:
         out = ''
@@ -491,7 +500,7 @@ def check_table(table=None, family='ipv4'):
 
 def new_table(table, family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Create new custom table.
 
@@ -514,7 +523,7 @@ def new_table(table, family='ipv4'):
 
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} add table {1} {2}'.format(_nftables_cmd(), nft_family, table)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if not out:
         out = True
@@ -523,7 +532,7 @@ def new_table(table, family='ipv4'):
 
 def delete_table(table, family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Create new custom table.
 
@@ -545,7 +554,7 @@ def delete_table(table, family='ipv4'):
 
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} delete table {1} {2}'.format(_nftables_cmd(), nft_family, table)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if not out:
         out = True
@@ -554,7 +563,7 @@ def delete_table(table, family='ipv4'):
 
 def new_chain(table='filter', chain=None, table_type=None, hook=None, priority=None, family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Create new chain to the specified table.
 
@@ -586,7 +595,7 @@ def new_chain(table='filter', chain=None, table_type=None, hook=None, priority=N
                 format(table, family)
 
     if check_chain(table, chain, family=family):
-        return 'Error: chain {0} in table {1} in family {1} already exists'.\
+        return 'Error: chain {0} in table {1} in family {2} already exists'.\
                 format(chain, table, family)
 
     nft_family = _NFTABLES_FAMILIES[family]
@@ -597,11 +606,10 @@ def new_chain(table='filter', chain=None, table_type=None, hook=None, priority=N
             cmd = r'{0} \{{ type {1} hook {2} priority {3}\; \}}'.\
                     format(cmd, table_type, hook, priority)
         else:
-            # Specifiy one, rqeuire all
-            return 'Error: table_type hook and priority required'.\
-                    format(table, family)
+            # Specify one, rqeuire all
+            return 'Error: table_type hook and priority required'
 
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if not out:
         out = True
@@ -610,7 +618,7 @@ def new_chain(table='filter', chain=None, table_type=None, hook=None, priority=N
 
 def delete_chain(table='filter', chain=None, family='ipv4'):
     '''
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     Delete the chain from the specified table.
 
@@ -636,13 +644,13 @@ def delete_chain(table='filter', chain=None, family='ipv4'):
                 format(table, family)
 
     if not check_chain(table, chain, family=family):
-        return 'Error: chain {0} in table {1} in family {1} does not exist'.\
+        return 'Error: chain {0} in table {1} in family {2} does not exist'.\
                 format(chain, table, family)
 
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} delete chain {1} {2} {3}'.\
             format(_nftables_cmd(), nft_family, table, chain)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if not out:
         out = True
@@ -680,7 +688,7 @@ def append(table='filter', chain=None, rule=None, family='ipv4'):
                 format(table, family)
 
     if not check_chain(table, chain, family=family):
-        return 'Error: chain {0} in table {1} in family {1} does not exist'.\
+        return 'Error: chain {0} in table {1} in family {2} does not exist'.\
                 format(chain, table, family)
 
     if check(table, chain, rule, family=family):
@@ -690,7 +698,7 @@ def append(table='filter', chain=None, rule=None, family='ipv4'):
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} add rule {1} {2} {3} {4}'.\
             format(_nftables_cmd(), nft_family, table, chain, rule)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
     if len(out) == 0:
         return True
     else:
@@ -737,7 +745,7 @@ def insert(table='filter', chain=None, position=None, rule=None, family='ipv4'):
                 format(table, family)
 
     if not check_chain(table, chain, family=family):
-        return 'Error: chain {0} in table {1} in family {1} does not exist'.\
+        return 'Error: chain {0} in table {1} in family {2} does not exist'.\
                 format(chain, table, family)
 
     if check(table, chain, rule, family=family):
@@ -751,7 +759,7 @@ def insert(table='filter', chain=None, position=None, rule=None, family='ipv4'):
     else:
         cmd = '{0} insert rule {1} {2} {3} {4}'.\
                 format(_nftables_cmd(), nft_family, table, chain, rule)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if len(out) == 0:
         return True
@@ -794,7 +802,7 @@ def delete(table, chain=None, position=None, rule=None, family='ipv4'):
                 format(table, family)
 
     if not check_chain(table, chain, family=family):
-        return 'Error: chain {0} in table {1} in family {1} does not exist'.\
+        return 'Error: chain {0} in table {1} in family {2} does not exist'.\
                 format(chain, table, family)
 
     if not check(table, chain, rule, family=family):
@@ -809,7 +817,7 @@ def delete(table, chain=None, position=None, rule=None, family='ipv4'):
     nft_family = _NFTABLES_FAMILIES[family]
     cmd = '{0} delete rule {1} {2} {3} handle {4}'.\
             format(_nftables_cmd(), nft_family, table, chain, position)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if len(out) == 0:
         return True
@@ -841,14 +849,14 @@ def flush(table='filter', chain='', family='ipv4'):
 
     if chain:
         if not check_chain(table, chain, family=family):
-            return 'Error: chain {0} in table {1} in family {1} does not exist'.\
+            return 'Error: chain {0} in table {1} in family {2} does not exist'.\
                     format(chain, table, nft_family)
         cmd = '{0} flush chain {1} {2} {3}'.\
                 format(_nftables_cmd(), nft_family, table, chain)
     else:
         cmd = '{0} flush table {1} {2}'.\
                 format(_nftables_cmd(), nft_family, table)
-    out = __salt__['cmd.run'](cmd)
+    out = __salt__['cmd.run'](cmd, python_shell=False)
 
     if len(out) == 0:
         return True

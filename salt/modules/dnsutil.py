@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 '''
-Compendium of generic DNS utilities
+Compendium of generic DNS utilities.
+
+.. note::
+
+    Some functions in the ``dnsutil`` execution module depend on ``dig``.
 '''
+# Import python libs
+from __future__ import absolute_import
+import logging
+import socket
+import time
 
 # Import salt libs
-import salt.utils
-import socket
-
-# Import python libs
-import logging
+import salt.utils.files
+import salt.utils.path
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +39,7 @@ def parse_hosts(hostsfile='/etc/hosts', hosts=None):
     '''
     if not hosts:
         try:
-            with salt.utils.fopen(hostsfile, 'r') as fp_:
+            with salt.utils.files.fopen(hostsfile, 'r') as fp_:
                 hosts = fp_.read()
         except Exception:
             return 'Error: hosts data was not found'
@@ -73,7 +79,7 @@ def hosts_append(hostsfile='/etc/hosts', ip_addr=None, entries=None):
         return 'No additional hosts were added to {0}'.format(hostsfile)
 
     append_line = '\n{0} {1}'.format(ip_addr, ' '.join(host_list))
-    with salt.utils.fopen(hostsfile, 'a') as fp_:
+    with salt.utils.files.fopen(hostsfile, 'a') as fp_:
         fp_.write(append_line)
 
     return 'The following line was added to {0}:{1}'.format(hostsfile,
@@ -93,24 +99,22 @@ def hosts_remove(hostsfile='/etc/hosts', entries=None):
         salt '*' dnsutil.hosts_remove /etc/hosts ad1.yuk.co
         salt '*' dnsutil.hosts_remove /etc/hosts ad2.yuk.co,ad1.yuk.co
     '''
-    with salt.utils.fopen(hostsfile, 'r') as fp_:
+    with salt.utils.files.fopen(hostsfile, 'r') as fp_:
         hosts = fp_.read()
 
     host_list = entries.split(',')
-    out_file = salt.utils.fopen(hostsfile, 'w')
-    for line in hosts.splitlines():
-        if not line or line.strip().startswith('#'):
-            out_file.write('{0}\n'.format(line))
-            continue
-        comps = line.split()
-        for host in host_list:
-            if host in comps[1:]:
-                comps.remove(host)
-        if len(comps) > 1:
-            out_file.write(' '.join(comps))
-            out_file.write('\n')
-
-    out_file.close()
+    with salt.utils.files.fopen(hostsfile, 'w') as out_file:
+        for line in hosts.splitlines():
+            if not line or line.strip().startswith('#'):
+                out_file.write('{0}\n'.format(line))
+                continue
+            comps = line.split()
+            for host in host_list:
+                if host in comps[1:]:
+                    comps.remove(host)
+            if len(comps) > 1:
+                out_file.write(' '.join(comps))
+                out_file.write('\n')
 
 
 def parse_zone(zonefile=None, zone=None):
@@ -125,7 +129,7 @@ def parse_zone(zonefile=None, zone=None):
     '''
     if zonefile:
         try:
-            with salt.utils.fopen(zonefile, 'r') as fp_:
+            with salt.utils.files.fopen(zonefile, 'r') as fp_:
                 zone = fp_.read()
         except Exception:
             pass
@@ -154,7 +158,7 @@ def parse_zone(zonefile=None, zone=None):
                 line = multi.replace('(', '').replace(')', '')
             else:
                 continue
-        if 'ORIGIN' in zonedict.keys():
+        if 'ORIGIN' in zonedict:
             comps = line.replace('@', zonedict['ORIGIN']).split()
         else:
             comps = line.split()
@@ -173,41 +177,46 @@ def parse_zone(zonefile=None, zone=None):
             continue
         if comps[0] == 'IN':
             comps.insert(0, zonedict['ORIGIN'])
-        if not comps[0].endswith('.'):
+        if not comps[0].endswith('.') and 'NS' not in line:
             comps[0] = '{0}.{1}'.format(comps[0], zonedict['ORIGIN'])
         if comps[2] == 'NS':
             zonedict.setdefault('NS', []).append(comps[3])
         elif comps[2] == 'MX':
-            if 'MX' not in zonedict.keys():
+            if 'MX' not in zonedict:
                 zonedict.setdefault('MX', []).append({'priority': comps[3],
                                                       'host': comps[4]})
+        elif comps[3] in ('A', 'AAAA'):
+            zonedict.setdefault(comps[3], {})[comps[0]] = {
+                'TARGET': comps[4],
+                'TTL': comps[1],
+            }
         else:
             zonedict.setdefault(comps[2], {})[comps[0]] = comps[3]
     return zonedict
 
 
-def _to_seconds(time):
+def _to_seconds(timestr):
     '''
     Converts a time value to seconds.
 
     As per RFC1035 (page 45), max time is 1 week, so anything longer (or
     unreadable) will be set to one week (604800 seconds).
     '''
-    time = time.upper()
-    if 'H' in time:
-        time = int(time.replace('H', '')) * 3600
-    elif 'D' in time:
-        time = int(time.replace('D', '')) * 86400
-    elif 'W' in time:
-        time = 604800
+    timestr = timestr.upper()
+    if 'H' in timestr:
+        seconds = int(timestr.replace('H', '')) * 3600
+    elif 'D' in timestr:
+        seconds = int(timestr.replace('D', '')) * 86400
+    elif 'W' in timestr:
+        seconds = 604800
     else:
         try:
-            time = int(time)
-        except Exception:
-            time = 604800
-    if time > 604800:
-        time = 604800
-    return time
+            seconds = int(timestr)
+        except ValueError:
+            seconds = 604800
+    if seconds > 604800:
+        seconds = 604800
+    return seconds
 
 
 def _has_dig():
@@ -216,7 +225,7 @@ def _has_dig():
     because they are also DNS utilities, a compatibility layer exists. This
     function helps add that layer.
     '''
-    return salt.utils.which('dig') is not None
+    return salt.utils.path.which('dig') is not None
 
 
 def check_ip(ip_addr):
@@ -227,7 +236,7 @@ def check_ip(ip_addr):
 
     .. code-block:: bash
 
-        salt ns1 dig.check_ip 127.0.0.1
+        salt ns1 dnsutil.check_ip 127.0.0.1
     '''
     if _has_dig():
         return __salt__['dig.check_ip'](ip_addr)
@@ -237,7 +246,7 @@ def check_ip(ip_addr):
 
 def A(host, nameserver=None):
     '''
-    Return the A record for 'host'.
+    Return the A record(s) for ``host``.
 
     Always returns a list.
 
@@ -245,17 +254,44 @@ def A(host, nameserver=None):
 
     .. code-block:: bash
 
-        salt ns1 dig.A www.google.com
+        salt ns1 dnsutil.A www.google.com
     '''
     if _has_dig():
         return __salt__['dig.A'](host, nameserver)
     elif nameserver is None:
         # fall back to the socket interface, if we don't care who resolves
         try:
-            (hostname, aliases, addresses) = socket.gethostbyname_ex(host)
+            addresses = [sock[4][0] for sock in socket.getaddrinfo(host, None, socket.AF_INET, 0, socket.SOCK_RAW)]
             return addresses
-        except socket.error:
-            return 'Unabled to resolve {0}'.format(host)
+        except socket.gaierror:
+            return 'Unable to resolve {0}'.format(host)
+
+    return 'This function requires dig, which is not currently available'
+
+
+def AAAA(host, nameserver=None):
+    '''
+    Return the AAAA record(s) for ``host``.
+
+    Always returns a list.
+
+    .. versionadded:: 2014.7.5
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt ns1 dnsutil.AAAA www.google.com
+    '''
+    if _has_dig():
+        return __salt__['dig.AAAA'](host, nameserver)
+    elif nameserver is None:
+        # fall back to the socket interface, if we don't care who resolves
+        try:
+            addresses = [sock[4][0] for sock in socket.getaddrinfo(host, None, socket.AF_INET6, 0, socket.SOCK_RAW)]
+            return addresses
+        except socket.gaierror:
+            return 'Unable to resolve {0}'.format(host)
 
     return 'This function requires dig, which is not currently available'
 
@@ -270,7 +306,7 @@ def NS(domain, resolve=True, nameserver=None):
 
     .. code-block:: bash
 
-        salt ns1 dig.NS google.com
+        salt ns1 dnsutil.NS google.com
 
     '''
     if _has_dig():
@@ -291,7 +327,7 @@ def SPF(domain, record='SPF', nameserver=None):
 
     .. code-block:: bash
 
-        salt ns1 dig.SPF google.com
+        salt ns1 dnsutil.SPF google.com
     '''
     if _has_dig():
         return __salt__['dig.SPF'](domain, record, nameserver)
@@ -314,9 +350,50 @@ def MX(domain, resolve=False, nameserver=None):
 
     .. code-block:: bash
 
-        salt ns1 dig.MX google.com
+        salt ns1 dnsutil.MX google.com
     '''
     if _has_dig():
         return __salt__['dig.MX'](domain, resolve, nameserver)
 
     return 'This function requires dig, which is not currently available'
+
+
+def serial(zone='', update=False):
+    '''
+    Return, store and update a dns serial for your zone files.
+
+    zone: a keyword for a specific zone
+
+    update: store an updated version of the serial in a grain
+
+    If ``update`` is False, the function will retrieve an existing serial or
+    return the current date if no serial is stored. Nothing will be stored
+
+    If ``update`` is True, the function will set the serial to the current date
+    if none exist or if the existing serial is for a previous date. If a serial
+    for greater than the current date is already stored, the function will
+    increment it.
+
+    This module stores the serial in a grain, you can explicitly set the
+    stored value as a grain named ``dnsserial_<zone_name>``.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt ns1 dnsutil.serial example.com
+    '''
+    grains = {}
+    key = 'dnsserial'
+    if zone:
+        key += '_{0}'.format(zone)
+    stored = __salt__['grains.get'](key=key)
+    present = time.strftime('%Y%m%d01')
+    if not update:
+        return stored or present
+    if stored and stored >= present:
+        current = str(int(stored) + 1)
+    else:
+        current = present
+    __salt__['grains.setval'](key=key, val=current)
+    return current

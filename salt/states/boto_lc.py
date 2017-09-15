@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 '''
 Manage Launch Configurations
-============================
 
-.. versionadded:: Helium
+.. versionadded:: 2014.7.0
 
 Create and destroy Launch Configurations. Be aware that this interacts with
 Amazon's services, and so may incur charges.
@@ -19,23 +18,26 @@ Also note that a launch configuration that's in use by an autoscale group can
 not be deleted until the autoscale group is no longer using it. This may affect
 the way in which you want to order your states.
 
-This module uses boto, which can be installed via package, or pip.
+This module uses ``boto``, which can be installed via package, or pip.
 
 This module accepts explicit autoscale credentials but can also utilize
-IAM roles assigned to the instance trough Instance Profiles. Dynamic
+IAM roles assigned to the instance through Instance Profiles. Dynamic
 credentials are then automatically obtained from AWS API and no further
-configuration is necessary. More Information available at::
+configuration is necessary. More information available `here
+<http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html>`_.
 
-   http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html
+If IAM roles are not used you need to specify them either in a pillar file or
+in the minion's config file:
 
-If IAM roles are not used you need to specify them either in a pillar or
-in the minion's config file::
+.. code-block:: yaml
 
     asg.keyid: GKTADJGHEIQSXMKKRBJ08H
     asg.key: askdjghsdfjkghWupUjasdflkdfklgjsdfjajkghs
 
-It's also possible to specify key, keyid and region via a profile, either
-as a passed in dict, or as a string to pull from pillars or minion config:
+It's also possible to specify ``key``, ``keyid`` and ``region`` via a profile, either
+passed in as a dict, or as a string to pull from pillars or minion config:
+
+.. code-block:: yaml
 
     myprofile:
         keyid: GKTADJGHEIQSXMKKRBJ08H
@@ -59,7 +61,14 @@ and autoscale groups are completely dependent on each other.
         - block_device_mappings:
             - '/dev/sda1':
                 size: 20
+                volume_type: 'io1'
+                iops: 220
+                delete_on_termination: true
         - cloud_init:
+            boothooks:
+              'disable-master.sh': |
+                #!/bin/bash
+                echo "manual" > /etc/init/salt-master.override
             scripts:
               'run_salt.sh': |
                 #!/bin/bash
@@ -89,6 +98,7 @@ and autoscale groups are completely dependent on each other.
             key: askdjghsdfjkghWupUjasdflkdfklgjsdfjajkghs
             region: us-east-1
 '''
+from __future__ import absolute_import
 from salt.exceptions import SaltInvocationError
 
 
@@ -103,6 +113,8 @@ def present(
         name,
         image_id,
         key_name=None,
+        vpc_id=None,
+        vpc_name=None,
         security_groups=None,
         user_data=None,
         cloud_init=None,
@@ -115,10 +127,6 @@ def present(
         instance_profile_name=None,
         ebs_optimized=False,
         associate_public_ip_address=None,
-        volume_type=None,
-        delete_on_termination=True,
-        iops=None,
-        use_block_device_types=False,
         region=None,
         key=None,
         keyid=None,
@@ -137,6 +145,16 @@ def present(
         Name of the EC2 key pair to use for instances. Key must exist or
         creation of the launch configuration will fail.
 
+    vpc_id
+        The VPC id where the security groups are defined. Only necessary when
+        using named security groups that exist outside of the default VPC.
+        Mutually exclusive with vpc_name.
+
+    vpc_name
+        Name of the VPC where the security groups are defined. Only Necessary
+        when using named security groups that exist outside of the default VPC.
+        Mutually exclusive with vpc_id.
+
     security_groups
         List of Names or security group id’s of the security groups with which
         to associate the EC2 instances or VPC instances, respectively. Security
@@ -147,7 +165,7 @@ def present(
 
     cloud_init
         A dict of cloud_init configuration. Currently supported values:
-        scripts, cloud-config. Mutually exlusive with user_data.
+        scripts, cloud-config. Mutually exclusive with user_data.
 
     instance_type
         The instance type. ex: m1.small.
@@ -159,7 +177,31 @@ def present(
         The RAM disk ID for the instance.
 
     block_device_mappings
-        A dict of block device mappings.
+        A dict of block device mappings that contains a dict
+        with volume_type, delete_on_termination, iops, size, encrypted,
+        snapshot_id.
+
+        volume_type
+            Indicates what volume type to use. Valid values are standard, io1, gp2.
+            Default is standard.
+
+        delete_on_termination
+            Indicates whether to delete the volume on instance termination (true) or
+            not (false).
+
+        iops
+            For Provisioned IOPS (SSD) volumes only. The number of I/O operations per
+            second (IOPS) to provision for the volume.
+
+        size
+            Desired volume size (in GiB).
+
+        encrypted
+            Indicates whether the volume should be encrypted. Encrypted EBS volumes must
+            be attached to instances that support Amazon EBS encryption. Volumes that are
+            created from encrypted snapshots are automatically encrypted. There is no way
+            to create an encrypted volume from an unencrypted snapshot or an unencrypted
+            volume from an encrypted snapshot.
 
     instance_monitoring
         Whether instances in group are launched with detailed monitoring.
@@ -182,18 +224,6 @@ def present(
         Virtual Private Cloud. Specifies whether to assign a public IP address
         to each instance launched in a Amazon VPC.
 
-    volume_type
-        Undocumented in boto.
-
-    delete_on_termination
-        Undocumented in boto.
-
-    iops
-        Undocumented in boto.
-
-    use_block_device_types
-        Undocumented in boto.
-
     region
         The region to connect to.
 
@@ -210,28 +240,44 @@ def present(
     if user_data and cloud_init:
         raise SaltInvocationError('user_data and cloud_init are mutually'
                                   ' exclusive options.')
-    ret = {'name': name, 'result': None, 'comment': '', 'changes': {}}
-    exists = __salt__['boto_asg.launch_configuration_exists'](name, region,
-                                                              key, keyid,
-                                                              profile)
+    ret = {'name': name, 'result': True, 'comment': '', 'changes': {}}
+    exists = __salt__['boto_asg.launch_configuration_exists'](name,
+                                                              region=region,
+                                                              key=key,
+                                                              keyid=keyid,
+                                                              profile=profile)
     if not exists:
         if __opts__['test']:
             msg = 'Launch configuration set to be created.'
             ret['comment'] = msg
+            ret['result'] = None
             return ret
         if cloud_init:
             user_data = __salt__['boto_asg.get_cloud_init_mime'](cloud_init)
         # TODO: Ensure image_id, key_name, security_groups and instance_profile
         # exist, or throw an invocation error.
         created = __salt__['boto_asg.create_launch_configuration'](
-            name, image_id, key_name, security_groups, user_data,
-            instance_type, kernel_id, ramdisk_id, block_device_mappings,
-            instance_monitoring, spot_price, instance_profile_name,
-            ebs_optimized, associate_public_ip_address, volume_type,
-            delete_on_termination, iops, use_block_device_types, region, key,
-            keyid, profile)
+            name,
+            image_id,
+            key_name=key_name,
+            vpc_id=vpc_id,
+            vpc_name=vpc_name,
+            security_groups=security_groups,
+            user_data=user_data,
+            instance_type=instance_type,
+            kernel_id=kernel_id,
+            ramdisk_id=ramdisk_id,
+            block_device_mappings=block_device_mappings,
+            instance_monitoring=instance_monitoring,
+            spot_price=spot_price,
+            instance_profile_name=instance_profile_name,
+            ebs_optimized=ebs_optimized,
+            associate_public_ip_address=associate_public_ip_address,
+            region=region,
+            key=key,
+            keyid=keyid,
+            profile=profile)
         if created:
-            ret['result'] = True
             ret['changes']['old'] = None
             ret['changes']['new'] = name
         else:
@@ -267,19 +313,24 @@ def absent(
         A dict with region, key and keyid, or a pillar key (string)
         that contains a dict with region, key and keyid.
     '''
-    ret = {'name': name, 'result': None, 'comment': '', 'changes': {}}
-    exists = __salt__['boto_asg.launch_configuration_exists'](name, region,
-                                                              key, keyid,
-                                                              profile)
+    ret = {'name': name, 'result': True, 'comment': '', 'changes': {}}
+    exists = __salt__['boto_asg.launch_configuration_exists'](name,
+                                                              region=region,
+                                                              key=key,
+                                                              keyid=keyid,
+                                                              profile=profile)
     if exists:
         if __opts__['test']:
-            ret['result'] = None
             ret['comment'] = 'Launch configuration set to be deleted.'
+            ret['result'] = None
             return ret
         deleted = __salt__['boto_asg.delete_launch_configuration'](
-            name, region, key, keyid, profile)
+                                                              name,
+                                                              region=region,
+                                                              key=key,
+                                                              keyid=keyid,
+                                                              profile=profile)
         if deleted:
-            ret['result'] = True
             ret['changes']['old'] = name
             ret['changes']['new'] = None
             ret['comment'] = 'Deleted launch configuration.'

@@ -15,20 +15,30 @@ opts['minion_floscript']
 opts['ioflo_period']
 opts['ioflo_realtime']
 opts['ioflo_verbose']
+opts['caller_floscript']
 '''
+
+# Import Python libs
+from __future__ import absolute_import
+import os
 
 # Import modules
 from . import core
 from . import worker
 from . import maint
+from . import reactor
+from . import zero
+from . import jobber
+from . import dummy
 
-__all__ = ['core', 'worker', 'maint']
+__all__ = ['core', 'worker', 'maint', 'zero', 'dummy', 'jobber', 'reactor']
 
 # Import salt libs
 import salt.daemons.masterapi
 
-# Import ioflo libs
-import ioflo.app.run
+# Import 3rd-party libs
+import ioflo.app.run  # pylint: disable=3rd-party-module-not-gated
+from salt.ext import six
 
 
 def explode_opts(opts):
@@ -36,9 +46,10 @@ def explode_opts(opts):
     Explode the opts into a preloads list
     '''
     preloads = [('.salt.opts', dict(value=opts))]
-    for key, val in opts.items():
+    for key, val in six.iteritems(opts):
         ukey = key.replace('.', '_')
         preloads.append(('.salt.etc.{0}'.format(ukey), dict(value=val)))
+    preloads.append(('.salt.etc.id', dict(value=opts['id'])))
     return preloads
 
 
@@ -66,6 +77,12 @@ class IofloMaster(object):
             behaviors = []
         behaviors.extend(['salt.daemons.flo'])
 
+        console_logdir = self.opts.get('ioflo_console_logdir', '')
+        if console_logdir:
+            consolepath = os.path.join(console_logdir, 'master.log')
+        else:  # empty means log to std out
+            consolepath = ''
+
         ioflo.app.run.start(
                 name='master',
                 period=float(self.opts['ioflo_period']),
@@ -80,6 +97,7 @@ class IofloMaster(object):
                 metas=None,
                 preloads=self.preloads,
                 verbose=int(self.opts['ioflo_verbose']),
+                consolepath=consolepath,
                 )
 
 
@@ -105,6 +123,12 @@ class IofloMinion(object):
 
         preloads = explode_opts(self.opts)
 
+        console_logdir = self.opts.get('ioflo_console_logdir', '')
+        if console_logdir:
+            consolepath = os.path.join(console_logdir, 'minion.log')
+        else:  # empty means log to std out
+            consolepath = ''
+
         ioflo.app.run.start(
                 name=self.opts['id'],
                 period=float(self.opts['ioflo_period']),
@@ -119,6 +143,41 @@ class IofloMinion(object):
                 metas=None,
                 preloads=preloads,
                 verbose=int(self.opts['ioflo_verbose']),
+                consolepath=consolepath,
                 )
 
     start = tune_in  # alias
+
+    def call_in(self, behaviors=None):
+        '''
+        Start up caller minion for salt-call when there is no local minion
+
+        '''
+        if behaviors is None:
+            behaviors = []
+        behaviors.extend(['salt.daemons.flo'])
+
+        preloads = explode_opts(self.opts)
+
+        console_logdir = self.opts.get('ioflo_console_logdir', '')
+        if console_logdir:
+            consolepath = os.path.join(console_logdir, 'caller.log')
+        else:  # empty means log to std out
+            consolepath = ''
+
+        ioflo.app.run.start(
+                name=self.opts['id'],
+                period=float(self.opts['ioflo_period']),
+                stamp=0.0,
+                real=self.opts['ioflo_realtime'],
+                filepath=self.opts['caller_floscript'],
+                behaviors=behaviors,
+                username="",
+                password="",
+                mode=None,
+                houses=None,
+                metas=None,
+                preloads=preloads,
+                verbose=int(self.opts['ioflo_verbose']),
+                consolepath=consolepath,
+                )

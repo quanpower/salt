@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
 '''
 Manage Apache Modules
-=====================
 
-.. versionadded:: Helium
+.. versionadded:: 2014.7.0
 
 Enable and disable apache modules.
 
 .. code-block:: yaml
 
     Enable cgi module:
-        apache_module.enable:
-            - name: cgi
+      apache_module.enabled:
+        - name: cgi
 
     Disable cgi module:
-        apache_module.disable:
-            - name: cgi
+      apache_module.disabled:
+        - name: cgi
 '''
-from salt._compat import string_types
+
+# Import Python libs
+from __future__ import absolute_import
+
+# Import salt libs
+from salt.ext.six import string_types
 
 
 def __virtual__():
@@ -27,9 +31,11 @@ def __virtual__():
     return 'apache_module' if 'apache.a2enmod' in __salt__ else False
 
 
-def enable(name):
+def enabled(name):
     '''
     Ensure an Apache module is enabled.
+
+    .. versionadded:: 2016.3.0
 
     name
         Name of the Apache module
@@ -41,6 +47,9 @@ def enable(name):
         if __opts__['test']:
             msg = 'Apache module {0} is set to be enabled.'.format(name)
             ret['comment'] = msg
+            ret['changes']['old'] = None
+            ret['changes']['new'] = name
+            ret['result'] = None
             return ret
         status = __salt__['apache.a2enmod'](name)['Status']
         if isinstance(status, string_types) and 'enabled' in status:
@@ -58,9 +67,11 @@ def enable(name):
     return ret
 
 
-def disable(name):
+def disabled(name):
     '''
     Ensure an Apache module is disabled.
+
+    .. versionadded:: 2016.3.0
 
     name
         Name of the Apache module
@@ -72,6 +83,9 @@ def disable(name):
         if __opts__['test']:
             msg = 'Apache module {0} is set to be disabled.'.format(name)
             ret['comment'] = msg
+            ret['changes']['old'] = name
+            ret['changes']['new'] = None
+            ret['result'] = None
             return ret
         status = __salt__['apache.a2dismod'](name)['Status']
         if isinstance(status, string_types) and 'disabled' in status:

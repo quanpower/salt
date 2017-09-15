@@ -4,10 +4,15 @@ The jail module for FreeBSD
 '''
 
 # Import python libs
+from __future__ import absolute_import
 import os
+import re
+import subprocess
 
 # Import salt libs
-import salt.utils
+import salt.utils.args
+import salt.utils.files
+import salt.utils.stringutils
 
 # Define the module's virtual name
 __virtualname__ = 'jail'
@@ -17,7 +22,10 @@ def __virtual__():
     '''
     Only runs on FreeBSD systems
     '''
-    return __virtualname__ if __grains__['os'] == 'FreeBSD' else False
+    if __grains__['os'] == 'FreeBSD':
+        return __virtualname__
+    return (False, 'The freebsdjail execution module cannot be loaded: '
+            'only available on FreeBSD systems.')
 
 
 def start(jail=''):
@@ -72,8 +80,12 @@ def is_enabled():
 
         salt '*' jail.is_enabled <jail name>
     '''
-    cmd = 'service -e | grep jail'
-    return not __salt__['cmd.retcode'](cmd)
+    cmd = 'service -e'
+    services = __salt__['cmd.run'](cmd, python_shell=False)
+    for service in services.split('\\n'):
+        if re.search('jail', service):
+            return True
+    return False
 
 
 def get_enabled():
@@ -89,7 +101,7 @@ def get_enabled():
     ret = []
     for rconf in ('/etc/rc.conf', '/etc/rc.conf.local'):
         if os.access(rconf, os.R_OK):
-            with salt.utils.fopen(rconf, 'r') as _fp:
+            with salt.utils.files.fopen(rconf, 'r') as _fp:
                 for line in _fp:
                     if not line.strip():
                         continue
@@ -112,16 +124,48 @@ def show_config(jail):
         salt '*' jail.show_config <jail name>
     '''
     ret = {}
-    for rconf in ('/etc/rc.conf', '/etc/rc.conf.local'):
-        if os.access(rconf, os.R_OK):
-            with salt.utils.fopen(rconf, 'r') as _fp:
-                for line in _fp:
-                    if not line.strip():
-                        continue
-                    if not line.startswith('jail_{0}_'.format(jail)):
-                        continue
-                    key, value = line.split('=')
-                    ret[key.split('_', 2)[2]] = value.split('"')[1]
+    if subprocess.call(["jls", "-nq", "-j", jail]) == 0:
+        jls = subprocess.check_output(["jls", "-nq", "-j", jail])  # pylint: disable=minimum-python-version
+        jailopts = salt.utils.args.shlex_split(salt.utils.stringutils.to_str(jls))
+        for jailopt in jailopts:
+            if '=' not in jailopt:
+                ret[jailopt.strip().rstrip(";")] = '1'
+            else:
+                key = jailopt.split('=')[0].strip()
+                value = jailopt.split('=')[-1].strip().strip("\"")
+                ret[key] = value
+    else:
+        for rconf in ('/etc/rc.conf', '/etc/rc.conf.local'):
+            if os.access(rconf, os.R_OK):
+                with salt.utils.files.fopen(rconf, 'r') as _fp:
+                    for line in _fp:
+                        if not line.strip():
+                            continue
+                        if not line.startswith('jail_{0}_'.format(jail)):
+                            continue
+                        key, value = line.split('=')
+                        ret[key.split('_', 2)[2]] = value.split('"')[1]
+        for jconf in ('/etc/jail.conf', '/usr/local/etc/jail.conf'):
+            if os.access(jconf, os.R_OK):
+                with salt.utils.files.fopen(jconf, 'r') as _fp:
+                    for line in _fp:
+                        line = line.partition('#')[0].strip()
+                        if line:
+                            if line.split()[-1] == '{':
+                                if line.split()[0] != jail and line.split()[0] != '*':
+                                    while line.split()[-1] != '}':
+                                        line = next(_fp)
+                                        line = line.partition('#')[0].strip()
+                                else:
+                                    continue
+                            if line.split()[-1] == '}':
+                                continue
+                            if '=' not in line:
+                                ret[line.strip().rstrip(";")] = '1'
+                            else:
+                                key = line.split('=')[0].strip()
+                                value = line.split('=')[-1].strip().strip(";'\"")
+                                ret[key] = value
     return ret
 
 
@@ -140,8 +184,11 @@ def fstab(jail):
     config = show_config(jail)
     if 'fstab' in config:
         c_fstab = config['fstab']
+    elif 'mount.fstab' in config:
+        c_fstab = config['mount.fstab']
+    if 'fstab' in config or 'mount.fstab' in config:
         if os.access(c_fstab, os.R_OK):
-            with salt.utils.fopen(c_fstab, 'r') as _fp:
+            with salt.utils.files.fopen(c_fstab, 'r') as _fp:
                 for line in _fp:
                     line = line.strip()
                     if not line:
@@ -176,8 +223,12 @@ def status(jail):
 
         salt '*' jail.status <jail name>
     '''
-    cmd = 'jls | grep {0}'.format(jail)
-    return not __salt__['cmd.retcode'](cmd)
+    cmd = 'jls'
+    found_jails = __salt__['cmd.run'](cmd, python_shell=False)
+    for found_jail in found_jails.split('\\n'):
+        if re.search(jail, found_jail):
+            return True
+    return False
 
 
 def sysctl():

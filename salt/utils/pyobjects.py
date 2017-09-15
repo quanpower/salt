@@ -5,14 +5,15 @@
 Pythonic object interface to creating state data, see the pyobjects renderer
 for more documentation.
 '''
+from __future__ import absolute_import
 import inspect
 import logging
 
-from collections import namedtuple
-
 from salt.utils.odict import OrderedDict
+from salt.utils.schema import Prepareable
+from salt.ext import six
 
-REQUISITES = ('require', 'watch', 'use', 'require_in', 'watch_in', 'use_in')
+REQUISITES = ('listen', 'onchanges', 'onfail', 'require', 'watch', 'use', 'listen_in', 'onchanges_in', 'onfail_in', 'require_in', 'watch_in', 'use_in')
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ class Registry(object):
     def salt_data(cls):
         states = OrderedDict([
             (id_, states_)
-            for id_, states_ in cls.states.iteritems()
+            for id_, states_ in six.iteritems(cls.states)
         ])
 
         if cls.includes:
@@ -66,7 +67,7 @@ class Registry(object):
         if cls.extends:
             states['extend'] = OrderedDict([
                 (id_, states_)
-                for id_, states_ in cls.extends.iteritems()
+                for id_, states_ in six.iteritems(cls.extends)
             ])
 
         cls.empty()
@@ -86,7 +87,7 @@ class Registry(object):
         if id_ in attr:
             if state.full_func in attr[id_]:
                 raise DuplicateState(
-                    "A state with id '{0!r}', type '{1!r}' exists".format(
+                    "A state with id '\'{0}\'', type '\'{1}\'' exists".format(
                         id_,
                         state.full_func
                     )
@@ -170,8 +171,8 @@ class StateFactory(object):
 
     def __getattr__(self, func):
         if len(self.valid_funcs) > 0 and func not in self.valid_funcs:
-            raise InvalidFunction('The function {0!r} does not exist in the '
-                                  'StateFactory for {1!r}'.format(
+            raise InvalidFunction('The function \'{0}\' does not exist in the '
+                                  'StateFactory for \'{1}\''.format(
                                       func,
                                       self.module
                                   ))
@@ -198,7 +199,7 @@ class State(object):
     This represents a single item in the state tree
 
     The id_ is the id of the state, the func is the full name of the salt
-    state (ie. file.managed). All the keyword args you pass in become the
+    state (i.e. file.managed). All the keyword args you pass in become the
     properties of your state.
     '''
 
@@ -206,6 +207,16 @@ class State(object):
         self.id_ = id_
         self.module = module
         self.func = func
+
+        # our requisites should all be lists, but when you only have a
+        # single item it's more convenient to provide it without
+        # wrapping it in a list. transform them into a list
+        for attr in REQUISITES:
+            if attr in kwargs:
+                try:
+                    iter(kwargs[attr])
+                except TypeError:
+                    kwargs[attr] = [kwargs[attr]]
         self.kwargs = kwargs
 
         if isinstance(self.id_, StateExtend):
@@ -223,12 +234,6 @@ class State(object):
         # handle our requisites
         for attr in REQUISITES:
             if attr in kwargs:
-                # our requisites should all be lists, but when you only have a
-                # single item it's more convenient to provide it without
-                # wrapping it in a list. transform them into a list
-                if not isinstance(kwargs[attr], list):
-                    kwargs[attr] = [kwargs[attr]]
-
                 # rebuild the requisite list transforming any of the actual
                 # StateRequisite objects into their representative dict
                 kwargs[attr] = [
@@ -240,7 +245,7 @@ class State(object):
         # have consistent ordering for tests
         return [
             {k: kwargs[k]}
-            for k in sorted(kwargs.iterkeys())
+            for k in sorted(six.iterkeys(kwargs))
         ]
 
     @property
@@ -272,43 +277,42 @@ class SaltObject(object):
         Salt.cmd.run(bar)
     '''
     def __init__(self, salt):
-        _mods = {}
-        for full_func in salt:
-            mod, func = full_func.split('.')
-
-            if mod not in _mods:
-                _mods[mod] = {}
-            _mods[mod][func] = salt[full_func]
-
-        # now transform using namedtuples
-        self.mods = {}
-        for mod in _mods.keys():
-            mod_name = '{0}Module'.format(str(mod).capitalize())
-            mod_object = namedtuple(mod_name, _mods[mod].keys())
-
-            self.mods[mod] = mod_object(**_mods[mod])
+        self._salt = salt
 
     def __getattr__(self, mod):
-        if mod not in self.mods:
-            raise AttributeError
+        class __wrapper__(object):
+            def __getattr__(wself, func):  # pylint: disable=E0213
+                try:
+                    return self._salt['{0}.{1}'.format(mod, func)]
+                except KeyError:
+                    raise AttributeError
+        return __wrapper__()
 
-        return self.mods[mod]
 
-
-class MapMeta(type):
+class MapMeta(six.with_metaclass(Prepareable, type)):
     '''
     This is the metaclass for our Map class, used for building data maps based
     off of grain data.
     '''
+    @classmethod
+    def __prepare__(metacls, name, bases):
+        return OrderedDict()
+
+    def __new__(cls, name, bases, attrs):
+        c = type.__new__(cls, name, bases, attrs)
+        c.__ordered_attrs__ = attrs.keys()
+        return c
+
     def __init__(cls, name, bases, nmspc):
         cls.__set_attributes__()
         super(MapMeta, cls).__init__(name, bases, nmspc)
 
     def __set_attributes__(cls):
-        match_groups = OrderedDict([])
+        match_info = []
+        grain_targets = set()
 
         # find all of our filters
-        for item in cls.__dict__:
+        for item in cls.__ordered_attrs__:
             if item[0] == '_':
                 continue
 
@@ -320,31 +324,56 @@ class MapMeta(type):
 
             # which grain are we filtering on
             grain = getattr(filt, '__grain__', 'os_family')
-            if grain not in match_groups:
-                match_groups[grain] = OrderedDict([])
+            grain_targets.add(grain)
 
             # does the object pointed to have a __match__ attribute?
             # if so use it, otherwise use the name of the object
             # this is so that you can match complex values, which the python
             # class name syntax does not allow
-            if hasattr(filt, '__match__'):
-                match = filt.__match__
-            else:
-                match = item
+            match = getattr(filt, '__match__', item)
 
-            match_groups[grain][match] = OrderedDict([])
+            match_attrs = {}
             for name in filt.__dict__:
-                if name[0] == '_':
-                    continue
+                if name[0] != '_':
+                    match_attrs[name] = filt.__dict__[name]
 
-                match_groups[grain][match][name] = filt.__dict__[name]
+            match_info.append((grain, match, match_attrs))
 
+        # Reorder based on priority
+        try:
+            if not hasattr(cls.priority, '__iter__'):
+                log.error('pyobjects: priority must be an iterable')
+            else:
+                new_match_info = []
+                for grain in cls.priority:
+                    # Using list() here because we will be modifying
+                    # match_info during iteration
+                    for index, item in list(enumerate(match_info)):
+                        try:
+                            if item[0] == grain:
+                                # Add item to new list
+                                new_match_info.append(item)
+                                # Clear item from old list
+                                match_info[index] = None
+                        except TypeError:
+                            # Already moved this item to new list
+                            pass
+                # Add in any remaining items not defined in priority
+                new_match_info.extend([x for x in match_info if x is not None])
+                # Save reordered list as the match_info list
+                match_info = new_match_info
+        except AttributeError:
+            pass
+
+        # Check for matches and update the attrs dict accordingly
         attrs = {}
-        for grain in match_groups:
-            filtered = Map.__salt__['grains.filter_by'](match_groups[grain],
-                                                        grain=grain)
-            if filtered:
-                attrs.update(filtered)
+        if match_info:
+            grain_vals = Map.__salt__['grains.item'](*grain_targets)
+            for grain, match, match_attrs in match_info:
+                if grain not in grain_vals:
+                    continue
+                if grain_vals[grain] == match:
+                    attrs.update(match_attrs)
 
         if hasattr(cls, 'merge'):
             pillar = Map.__salt__['pillar.get'](cls.merge)
@@ -360,8 +389,7 @@ def need_salt(*a, **k):
     return {}
 
 
-class Map(object):
-    __metaclass__ = MapMeta
+class Map(six.with_metaclass(MapMeta, object)):  # pylint: disable=W0232
     __salt__ = {
         'grains.filter_by': need_salt,
         'pillar.get': need_salt

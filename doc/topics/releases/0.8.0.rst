@@ -68,7 +68,7 @@ it to a specific module. The returner modules work like minion modules, so any
 returner can be added to the minions.
 
 This means that a custom data returner can be added to communicate the return
-data so anything from MySQL, Redis, MongoDB and more!
+data so anything from MySQL, Redis, MongoDB, and more!
 
 There are 2 simple stock returners in the returners directory:
 
@@ -84,7 +84,7 @@ configuration file can be accessed inside of the minion modules via the __opt__
 dict.
 
 Information on how to use this simple addition has been added to the wiki:
-:doc:`Writing modules </ref/states/writing>`
+:ref:`Writing modules <state-modules>`
 
 The test module has an example of using the __opts__ dict, and how to set
 default options:

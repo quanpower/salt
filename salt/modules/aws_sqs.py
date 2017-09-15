@@ -2,11 +2,16 @@
 '''
 Support for the Amazon Simple Queue Service.
 '''
+
+# Import Python libs
+from __future__ import absolute_import
 import logging
 import json
 
 # Import salt libs
 import salt.utils
+import salt.utils.path
+from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -14,10 +19,10 @@ _OUTPUT = '--output json'
 
 
 def __virtual__():
-    if salt.utils.which('aws'):
+    if salt.utils.path.which('aws'):
         # awscli is installed, load the module
         return True
-    return False
+    return (False, 'The module aws_sqs could not be loaded: aws command not found')
 
 
 def _region(region):
@@ -51,7 +56,7 @@ def _run_aws(cmd, region, opts, user, **kwargs):
         kwargs['max-number-of-messages'] = num
 
     _formatted_args = [
-        '--{0} "{1}"'.format(k, v) for k, v in kwargs.iteritems()]
+        '--{0} "{1}"'.format(k, v) for k, v in six.iteritems(kwargs)]
 
     cmd = 'aws sqs {cmd} {args} {region} {out}'.format(
         cmd=cmd,
@@ -59,7 +64,7 @@ def _run_aws(cmd, region, opts, user, **kwargs):
         region=_region(region),
         out=_OUTPUT)
 
-    rtn = __salt__['cmd.run'](cmd, runas=user)
+    rtn = __salt__['cmd.run'](cmd, runas=user, python_shell=False)
 
     return json.loads(rtn) if rtn else ''
 
@@ -90,7 +95,7 @@ def receive_message(queue, region, num=1, opts=None, user=None):
         salt '*' aws_sqs.receive_message <sqs queue> <region>
         salt '*' aws_sqs.receive_message <sqs queue> <region> num=10
 
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     '''
     ret = {
@@ -134,7 +139,7 @@ def delete_message(queue, region, receipthandle, opts=None, user=None):
 
         salt '*' aws_sqs.delete_message <sqs queue> <region> receipthandle='<sqs ReceiptHandle>'
 
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     '''
     queues = list_queues(region, opts, user)
@@ -160,6 +165,11 @@ def list_queues(region, opts=None, user=None):
 
     user : None
         Run hg as a user other than what the minion runs as
+
+    CLI Example:
+
+        salt '*' aws_sqs.list_queues <region>
+
     '''
     out = _run_aws('list-queues', region, opts, user)
 
@@ -185,6 +195,11 @@ def create_queue(name, region, opts=None, user=None):
 
     user : None
         Run hg as a user other than what the minion runs as
+
+    CLI Example:
+
+        salt '*' aws_sqs.create_queue <sqs queue> <region>
+
     '''
 
     create = {'queue-name': name}
@@ -214,12 +229,17 @@ def delete_queue(name, region, opts=None, user=None):
 
     user : None
         Run hg as a user other than what the minion runs as
+
+    CLI Example:
+
+        salt '*' aws_sqs.delete_queue <sqs queue> <region>
+
     '''
     queues = list_queues(region, opts, user)
     url_map = _parse_queue_list(queues)
 
     logger = logging.getLogger(__name__)
-    logger.debug('map ' + unicode(url_map))
+    logger.debug('map ' + six.text_type(url_map))
     if name in url_map:
         delete = {'queue-url': url_map[name]}
 
@@ -261,6 +281,11 @@ def queue_exists(name, region, opts=None, user=None):
 
     user : None
         Run hg as a user other than what the minion runs as
+
+    CLI Example:
+
+        salt '*' aws_sqs.queue_exists <sqs queue> <region>
+
     '''
     output = list_queues(region, opts, user)
 

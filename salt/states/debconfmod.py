@@ -3,6 +3,8 @@
 Management of debconf selections
 ================================
 
+:depends:   - debconf-utils package
+
 The debconfmod state module manages the enforcement of debconf selections,
 this state can set those selections prior to package installation.
 
@@ -32,10 +34,11 @@ set_file
             'ferm/enable': {'type': 'boolean', 'value': True}
 
 .. note::
-    Due to how PyYAML imports nested dicts (see :doc:`here
-    </topics/troubleshooting/yaml_idiosyncrasies>`), the values in the ``data``
-    dict must be indented four spaces instead of two.
+    Due to how PyYAML imports nested dicts (see :ref:`here <yaml-idiosyncrasies>`),
+    the values in the ``data`` dict must be indented four spaces instead of two.
 '''
+from __future__ import absolute_import
+from salt.ext import six
 
 
 # Define the module's virtual name
@@ -55,9 +58,9 @@ def __virtual__():
     return __virtualname__
 
 
-def set_file(name, source, **kwargs):
+def set_file(name, source, template=None, context=None, defaults=None, **kwargs):
     '''
-    Set debconf selections from a file
+    Set debconf selections from a file or a template
 
     .. code-block:: yaml
 
@@ -69,20 +72,57 @@ def set_file(name, source, **kwargs):
           debconf.set_file:
             - source: salt://pathto/pkg.selections?saltenv=myenvironment
 
+        <state_id>:
+          debconf.set_file:
+            - source: salt://pathto/pkg.selections.jinja2
+            - template: jinja
+            - context:
+                some_value: "false"
+
     source:
         The location of the file containing the package selections
+
+    template
+        If this setting is applied then the named templating engine will be
+        used to render the package selections file, currently jinja, mako, and
+        wempy are supported
+
+    context
+        Overrides default context variables passed to the template.
+
+    defaults
+        Default context passed to the template.
     '''
     ret = {'name': name,
            'changes': {},
            'result': True,
            'comment': ''}
 
+    if context is None:
+        context = {}
+    elif not isinstance(context, dict):
+        ret['result'] = False
+        ret['comment'] = 'Context must be formed as a dict'
+        return ret
+
+    if defaults is None:
+        defaults = {}
+    elif not isinstance(defaults, dict):
+        ret['result'] = False
+        ret['comment'] = 'Defaults must be formed as a dict'
+        return ret
+
     if __opts__['test']:
         ret['result'] = None
         ret['comment'] = 'Debconf selections would have been set.'
         return ret
 
-    if __salt__['debconf.set_file'](source, **kwargs):
+    if template:
+        result = __salt__['debconf.set_template'](source, template, context, defaults, **kwargs)
+    else:
+        result = __salt__['debconf.set_file'](source, **kwargs)
+
+    if result:
         ret['comment'] = 'Debconf selections were set.'
     else:
         ret['result'] = False
@@ -91,7 +131,7 @@ def set_file(name, source, **kwargs):
     return ret
 
 
-def set(name, data):
+def set(name, data, **kwargs):
     '''
     Set debconf selections
 
@@ -134,7 +174,7 @@ def set(name, data):
 
     current = __salt__['debconf.show'](name)
 
-    for (key, args) in data.iteritems():
+    for (key, args) in six.iteritems(data):
         # For debconf data, valid booleans are 'true' and 'false';
         # But str()'ing the args['value'] will result in 'True' and 'False'
         # which will be ignored and overridden by a dpkg-reconfigure.

@@ -3,16 +3,25 @@
 A general map/reduce style salt runner for aggregating results
 returned by several different minions.
 
-.. versionadded:: Helium
+.. versionadded:: 2014.7.0
 
 Aggregated results are sorted by the size of the minion pools which returned
 matching results.
 
-Useful for playing the game: " some of these things are not like the others... "
+Useful for playing the game: *"some of these things are not like the others..."*
 when identifying discrepancies in a large infrastructure managed by salt.
 '''
 
+# Import python libs
+from __future__ import absolute_import, print_function
+
+# Import salt libs
 import salt.client
+from salt.exceptions import SaltClientError
+
+# Import 3rd-party libs
+from salt.ext import six
+from salt.ext.six.moves import range
 
 
 def hash(*args, **kwargs):
@@ -20,43 +29,30 @@ def hash(*args, **kwargs):
     Return the MATCHING minion pools from the aggregated and sorted results of
     a salt command
 
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     This command is submitted via a salt runner using the
-    general form:
+    general form::
 
         salt-run survey.hash [survey_sort=up/down] <target>
                   <salt-execution-module> <salt-execution-module parameters>
 
-    Optionally accept a "survey_sort=" parameter. Default: "survey_sort=down"
+    Optionally accept a ``survey_sort=`` parameter. Default: ``survey_sort=down``
 
-    CLI Example #1: ( functionally equivalent to "salt-run manage.up" )
+    CLI Example #1: (functionally equivalent to ``salt-run manage.up``)
 
     .. code-block:: bash
 
         salt-run survey.hash "*" test.ping
 
-    CLI Example #2: ( find an "outlier" minion config file )
+    CLI Example #2: (find an "outlier" minion config file)
 
     .. code-block:: bash
 
         salt-run survey.hash "*" file.get_hash /etc/salt/minion survey_sort=up
     '''
 
-    bulk_ret = _get_pool_results(*args, **kwargs)
-    for k in bulk_ret:
-        print 'minion pool :\n' \
-              '------------'
-        print k['pool']
-        print 'pool size :\n' \
-              '----------'
-        print '    ' + str(len(k['pool']))
-        print 'pool result :\n' \
-              '-------'
-        print '    ' + str(k['result'])
-        print '\n'
-
-    return bulk_ret
+    return _get_pool_results(*args, **kwargs)
 
 
 def diff(*args, **kwargs):
@@ -64,24 +60,27 @@ def diff(*args, **kwargs):
     Return the DIFFERENCE of the result sets returned by each matching minion
     pool
 
-    .. versionadded:: Helium
+    .. versionadded:: 2014.7.0
 
     These pools are determined from the aggregated and sorted results of
     a salt command.
-    This command displays the "diffs" as a series of 2-way differences-- namely
-    the diffence between the FIRST displayed minion pool
-    (according to sort order) and EACH SUBSEQUENT minion pool result set.
-    Differences are displayed according to the Python "difflib.unified_diff()"
-    as in the case of the salt execution module "file.get_diff".
 
-    This command is submitted via a salt runner using the general form:
+    This command displays the "diffs" as a series of 2-way differences --
+    namely the difference between the FIRST displayed minion pool
+    (according to sort order) and EACH SUBSEQUENT minion pool result set.
+
+    Differences are displayed according to the Python ``difflib.unified_diff()``
+    as in the case of the salt execution module ``file.get_diff``.
+
+    This command is submitted via a salt runner using the general form::
 
         salt-run survey.diff [survey_sort=up/down] <target>
                      <salt-execution-module> <salt-execution-module parameters>
 
-    Optionally accept a "survey_sort=" parameter. Default: "survey_sort=down"
+    Optionally accept a ``survey_sort=`` parameter. Default:
+    ``survey_sort=down``
 
-    CLI Example #1: ( Example to display the "differences of files" )
+    CLI Example #1: (Example to display the "differences of files")
 
     .. code-block:: bash
 
@@ -97,29 +96,29 @@ def diff(*args, **kwargs):
 
     is_first_time = True
     for k in bulk_ret:
-        print 'minion pool :\n' \
-              '------------'
-        print k['pool']
-        print 'pool size :\n' \
-              '----------'
-        print '    ' + str(len(k['pool']))
+        print('minion pool :\n'
+              '------------')
+        print(k['pool'])
+        print('pool size :\n'
+              '----------')
+        print('    ' + str(len(k['pool'])))
         if is_first_time:
             is_first_time = False
-            print 'pool result :\n' \
-                  '------------'
-            print '    ' + bulk_ret[0]['result']
-            print
+            print('pool result :\n'
+                  '------------')
+            print('    ' + bulk_ret[0]['result'])
+            print()
             continue
 
         outs = ('differences from "{0}" results :').format(
             bulk_ret[0]['pool'][0])
-        print outs
-        print '-' * (len(outs) - 1)
+        print(outs)
+        print('-' * (len(outs) - 1))
         from_result = bulk_ret[0]['result'].splitlines()
-        for i in xrange(0, len(from_result)):
+        for i in range(0, len(from_result)):
             from_result[i] += '\n'
         to_result = k['result'].splitlines()
-        for i in xrange(0, len(to_result)):
+        for i in range(0, len(to_result)):
             to_result[i] += '\n'
         outs = ''
         outs += ''.join(difflib.unified_diff(from_result,
@@ -127,8 +126,8 @@ def diff(*args, **kwargs):
                                              fromfile=bulk_ret[0]['pool'][0],
                                              tofile=k['pool'][0],
                                              n=0))
-        print outs
-        print
+        print(outs)
+        print()
 
     return bulk_ret
 
@@ -152,22 +151,33 @@ def _get_pool_results(*args, **kwargs):
 
     tgt = args[0]
     cmd = args[1]
+    ret = {}
 
-    sort = kwargs.get('survey_sort', 'down')
+    sort = kwargs.pop('survey_sort', 'down')
     direction = sort != 'up'
 
+    tgt_type = kwargs.pop('tgt_type', 'compound')
+    if tgt_type not in ['compound', 'pcre']:
+        tgt_type = 'compound'
+
+    kwargs_passthru = dict((k, kwargs[k]) for k in six.iterkeys(kwargs) if not k.startswith('_'))
+
     client = salt.client.get_local_client(__opts__['conf_file'])
-    minions = client.cmd(tgt, cmd, args[2:], timeout=__opts__['timeout'])
-    ret = {}
+    try:
+        minions = client.cmd(tgt, cmd, args[2:], timeout=__opts__['timeout'], tgt_type=tgt_type, kwarg=kwargs_passthru)
+    except SaltClientError as client_error:
+        print(client_error)
+        return ret
+
     # hash minion return values as a string
     for minion in sorted(minions):
-        h = hashlib.sha256(str(minions[minion])).hexdigest()
-        if h not in ret:
-            ret[h] = {}
-            ret[h]['pool'] = []
-            ret[h]['result'] = str(minions[minion])
+        digest = hashlib.sha256(str(minions[minion])).hexdigest()
+        if digest not in ret:
+            ret[digest] = {}
+            ret[digest]['pool'] = []
+            ret[digest]['result'] = str(minions[minion])
 
-        ret[h]['pool'].append(minion)
+        ret[digest]['pool'].append(minion)
 
     sorted_ret = []
     for k in sorted(ret, key=lambda k: len(ret[k]['pool']), reverse=direction):

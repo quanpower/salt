@@ -4,7 +4,7 @@ Read tops data from a reclass database
 
 .. |reclass| replace:: **reclass**
 
-This :doc:`master_tops </topics/master_tops/index>` plugin provides access to
+This :ref:`master_tops <master-tops-system>` plugin provides access to
 the |reclass| database, such that state information (top data) are retrieved
 from |reclass|.
 
@@ -46,6 +46,7 @@ If you want to run reclass from source, rather than installing it, you can
 either let the master know via the ``PYTHONPATH`` environment variable, or by
 setting the configuration option, like in the example above.
 '''
+from __future__ import absolute_import
 
 # This file cannot be called reclass.py, because then the module import would
 # not work. Thanks to the __virtual__ function, however, the plugin still
@@ -84,8 +85,10 @@ def top(**kwargs):
 
     # If reclass is installed, __virtual__ put it onto the search path, so we
     # don't need to protect against ImportError:
+    # pylint: disable=3rd-party-module-not-gated
     from reclass.adapters.salt import top as reclass_top
     from reclass.errors import ReclassException
+    # pylint: enable=3rd-party-module-not-gated
 
     try:
         # Salt's top interface is inconsistent with ext_pillar (see #5786) and
@@ -114,7 +117,7 @@ def top(**kwargs):
         return reclass_top(minion_id, **reclass_opts)
 
     except ImportError as e:
-        if 'reclass' in e.message:
+        if 'reclass' in str(e):
             raise SaltInvocationError(
                 'master_tops.reclass: cannot find reclass module '
                 'in {0}'.format(sys.path)
@@ -123,8 +126,8 @@ def top(**kwargs):
             raise
 
     except TypeError as e:
-        if 'unexpected keyword argument' in e.message:
-            arg = e.message.split()[-1]
+        if 'unexpected keyword argument' in str(e):
+            arg = str(e).split()[-1]
             raise SaltInvocationError(
                 'master_tops.reclass: unexpected option: {0}'.format(arg)
             )
@@ -132,11 +135,11 @@ def top(**kwargs):
             raise
 
     except KeyError as e:
-        if 'reclass' in e.message:
+        if 'reclass' in str(e):
             raise SaltInvocationError('master_tops.reclass: no configuration '
                                       'found in master config')
         else:
             raise
 
     except ReclassException as e:
-        raise SaltInvocationError('master_tops.reclass: {0}'.format(e.message))
+        raise SaltInvocationError('master_tops.reclass: {0}'.format(str(e)))
